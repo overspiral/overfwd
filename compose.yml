@@ -1,0 +1,43 @@
+# Shared GreenMail mail server for e2e testing the REST -> IMAP/SMTP bridge.
+#
+# ONE stack, shared by ALL git worktrees. Start it once from any worktree:
+#     make mail-up                       # podman-compose -p overfwd-mail up -d
+#     make mail-up COMPOSE="docker compose"   # on a Docker host
+#
+# Cross-worktree sharing is guaranteed by (a) the fixed project name `overfwd-mail`
+# passed via `-p` in the Makefile, (b) the fixed `container_name` below, and
+# (c) the fixed host ports — so a second `up` from another worktree is a no-op,
+# not a port collision. (Top-level `name:` is intentionally omitted: legacy
+# docker-compose v1 rejects it; `-p` works on v1, Compose v2, and podman-compose.)
+# Do NOT start a second stack per worktree — reset state instead
+# (make mail-reset / POST /api/service/reset). See README.md.
+
+services:
+  greenmail:
+    image: greenmail/standalone:2.1.9
+    container_name: overfwd-greenmail
+    restart: unless-stopped
+    environment:
+      # setup.test.all  -> start SMTP/SMTPS/IMAP/IMAPS/POP3/POP3S on default test ports
+      # hostname=0.0.0.0 -> bind all interfaces so host port mappings reach it
+      # users=...        -> preconfigured deterministic accounts (login:password@domain)
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users=test:test@localhost,alice:alice@localhost
+        -Dgreenmail.verbose
+    ports:
+      - "3025:3025"   # SMTP
+      - "3465:3465"   # SMTPS  (implicit TLS, built-in self-signed cert)
+      - "3143:3143"   # IMAP
+      - "3993:3993"   # IMAPS  (implicit TLS, built-in self-signed cert)
+      - "3110:3110"   # POP3
+      - "3995:3995"   # POP3S
+      - "8080:8080"   # management REST API (reset / readiness / users / mail)
+    healthcheck:
+      # The image ships no wget/curl/nc, only bash — use a /dev/tcp probe against IMAP.
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/3143' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s

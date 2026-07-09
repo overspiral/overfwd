@@ -1,0 +1,13 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Local environment (per-worktree, seeded from .env.example)
+.env
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
