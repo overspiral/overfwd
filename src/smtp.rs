@@ -34,6 +34,11 @@ use mail_builder::MessageBuilder;
 use crate::auth::{HostPort, Secret};
 use crate::error::GatewayError;
 
+/// Environment flag: skip TLS certificate verification (self-signed providers such
+/// as the GreenMail e2e stack). Off by default — real providers get real
+/// verification. Mirrors the IMAP client's flag of the same name.
+const ENV_TLS_INSECURE: &str = "MAIL_TLS_INSECURE";
+
 /// How to secure the connection to the SMTP endpoint.
 ///
 /// The mailbox wire contract (SPEC §5) carries only a non-secret `host:port` in
@@ -74,6 +79,42 @@ impl SmtpSecurity {
     }
 }
 
+/// Runtime transport tuning for SMTP submission, sourced from the environment.
+///
+/// Mirrors the IMAP client's `ImapSettings`: kept separate from the gateway's own
+/// [`crate::Config`] on purpose — this is provider-transport tuning, not the
+/// gateway's own posture (bind, api_key). The `send` action reads one per request.
+#[derive(Debug, Clone)]
+pub struct SmtpSettings {
+    /// When `true`, implicit-TLS handshakes accept any server certificate (SPEC §4
+    /// — GreenMail's built-in self-signed cert). Driven by `MAIL_TLS_INSECURE`.
+    pub tls_insecure: bool,
+}
+
+impl SmtpSettings {
+    /// Read settings from the process environment. `MAIL_TLS_INSECURE` is a
+    /// permissive boolean (`1/true/yes/on`); anything else (or unset) is `false`.
+    pub fn from_env() -> Self {
+        let tls_insecure = std::env::var(ENV_TLS_INSECURE)
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        SmtpSettings { tls_insecure }
+    }
+
+    /// Choose the transport security for a submission target. The `X-Mailbox-Smtp`
+    /// wire value is a bare `host:port` with no scheme (SPEC §5), so security is
+    /// inferred from the port via [`SmtpSecurity::for_submission_port`].
+    pub fn security_for(&self, smtp: &HostPort) -> SmtpSecurity {
+        SmtpSecurity::for_submission_port(smtp.port, self.tls_insecure)
+    }
+}
+
 /// The body of an outgoing message.
 ///
 /// Modelled as an enum so "no body at all" is unrepresentable: every message
@@ -101,6 +142,10 @@ pub struct OutgoingMessage {
     pub to: Vec<String>,
     /// Carbon-copy recipients (`Cc`). May be empty.
     pub cc: Vec<String>,
+    /// Blind-carbon-copy recipients (`Bcc`). May be empty. These are `RCPT TO`'d
+    /// like any recipient but are **never** written into a header — a `Bcc` header
+    /// would defeat the point. See [`build_envelope`] / [`build_mime`].
+    pub bcc: Vec<String>,
     /// The `Subject` header.
     pub subject: String,
     /// The message body.
@@ -146,6 +191,10 @@ fn build_mime(message: &OutgoingMessage) -> Result<Vec<u8>, GatewayError> {
         builder = builder.cc(cc);
     }
 
+    // `bcc` is intentionally *not* written as a header: a `Bcc` header would leak
+    // the blind recipients to everyone. They reach the mail via the envelope's
+    // `RCPT TO` only (see `build_envelope`).
+
     builder = match &message.body {
         OutgoingBody::Text(text) => builder.text_body(text.as_str()),
         OutgoingBody::Html(html) => builder.html_body(html.as_str()),
@@ -161,15 +210,21 @@ fn build_mime(message: &OutgoingMessage) -> Result<Vec<u8>, GatewayError> {
 
 /// Build the SMTP envelope (`MAIL FROM` / `RCPT TO`) from the message.
 ///
-/// The envelope recipient list is `to` **plus** `cc` — both must receive the
-/// message even though only `To` addresses appear in that header. Any malformed
-/// address is a [`GatewayError::BadRequest`] naming the offending value (addresses
-/// are non-secret).
+/// The envelope recipient list is `to` **plus** `cc` **plus** `bcc` — all must
+/// receive the message even though only `To`/`Cc` addresses appear in a header
+/// (`bcc` is deliberately blind — see [`build_mime`]). Any malformed address is a
+/// [`GatewayError::BadRequest`] naming the offending value (addresses are non-secret).
 fn build_envelope(message: &OutgoingMessage) -> Result<Envelope, GatewayError> {
     let from = parse_address("from", &message.from)?;
 
-    let mut recipients = Vec::with_capacity(message.to.len() + message.cc.len());
-    for addr in message.to.iter().chain(message.cc.iter()) {
+    let mut recipients =
+        Vec::with_capacity(message.to.len() + message.cc.len() + message.bcc.len());
+    for addr in message
+        .to
+        .iter()
+        .chain(message.cc.iter())
+        .chain(message.bcc.iter())
+    {
         recipients.push(parse_address("recipient", addr)?);
     }
 
@@ -274,6 +329,7 @@ mod tests {
             from: "test@localhost".to_string(),
             to: vec!["alice@localhost".to_string()],
             cc: vec![],
+            bcc: vec![],
             subject: "Hello".to_string(),
             body,
         }
@@ -325,6 +381,57 @@ mod tests {
         assert!(
             recipients.contains(&"c@localhost".to_string()),
             "{recipients:?}"
+        );
+    }
+
+    #[test]
+    fn envelope_includes_bcc_recipients() {
+        let mut m = msg(OutgoingBody::Text("body".to_string()));
+        m.cc = vec!["c@localhost".to_string()];
+        m.bcc = vec!["d@localhost".to_string()];
+
+        let envelope = build_envelope(&m).unwrap();
+        let recipients: Vec<String> = envelope.to().iter().map(|a| a.to_string()).collect();
+        assert_eq!(recipients.len(), 3, "to + cc + bcc must all be RCPT TO'd");
+        assert!(
+            recipients.contains(&"d@localhost".to_string()),
+            "bcc must be RCPT TO'd: {recipients:?}"
+        );
+    }
+
+    #[test]
+    fn bcc_is_never_written_as_a_header() {
+        let mut m = msg(OutgoingBody::Text("body".to_string()));
+        m.bcc = vec!["secret-bcc@localhost".to_string()];
+        let rendered = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        assert!(
+            !rendered.contains("secret-bcc@localhost"),
+            "the Bcc recipient must not leak into any header: {rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("bcc:"),
+            "no Bcc header may be emitted: {rendered}"
+        );
+    }
+
+    #[test]
+    fn security_for_infers_from_smtp_port() {
+        let insecure = SmtpSettings { tls_insecure: true };
+        let secure = SmtpSettings {
+            tls_insecure: false,
+        };
+        let hp = |port| HostPort {
+            host: "localhost".to_string(),
+            port,
+        };
+        assert_eq!(secure.security_for(&hp(3025)), SmtpSecurity::Plaintext);
+        assert_eq!(
+            insecure.security_for(&hp(3465)),
+            SmtpSecurity::ImplicitTls { insecure: true }
+        );
+        assert_eq!(
+            secure.security_for(&hp(465)),
+            SmtpSecurity::ImplicitTls { insecure: false }
         );
     }
 
