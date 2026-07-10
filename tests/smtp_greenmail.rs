@@ -20,6 +20,7 @@ fn message() -> OutgoingMessage {
         from: "test@localhost".to_string(),
         to: vec!["alice@localhost".to_string()],
         cc: vec![],
+        bcc: vec![],
         subject: "overfwd smtp e2e".to_string(),
         body: OutgoingBody::Text("Sent through the overfwd SMTP module.".to_string()),
     }
