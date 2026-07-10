@@ -15,6 +15,7 @@
 //! | [`auth::MailboxCredential`]    | §5 Axis 2 (Inline) | Parsed `X-Mailbox-Auth` / `X-Mailbox-Imap` / `X-Mailbox-Smtp`. The `Basic` value is never logged. |
 //! | [`auth::Secret`]               | §5, §6         | Redacting wrapper so mailbox passwords never reach logs or disclosures. |
 //! | [`error::GatewayError`]        | §7             | Bounded, machine-readable error codes mapped to HTTP status + a stable `{ code, message }` body. |
+//! | [`smtp::submit`]               | §4, §7         | Build a message (`mail-builder`) and submit it over SMTP (`lettre`), mapping transport failures onto [`GatewayError`]. |
 //! | [`routes::router`]             | §6             | `POST /email/{search,get,send}` — registered here, stubbed to `not_implemented` for now. |
 //!
 //! Out of scope for this task (SPEC §5, §11): Portfolio/Session credential
@@ -25,6 +26,7 @@ pub mod config;
 pub mod error;
 pub mod imap;
 pub mod routes;
+pub mod smtp;
 
 use std::sync::Arc;
 
