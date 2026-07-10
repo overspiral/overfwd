@@ -2,9 +2,9 @@
 //!
 //! A stateless REST facade over remote IMAP/SMTP mailboxes. This crate is the
 //! **spine** of the gateway: configuration, the two-axis auth model, the typed
-//! error model, and route registration. The provider-facing IMAP/SMTP work and
-//! the real action bodies land in later tasks; this crate deliberately keeps the
-//! surface Inline-only (SPEC §5).
+//! error model, route registration, and the three v1 actions — `search`/`get` over
+//! IMAP and `send` over SMTP. The connection pool lands in a later task; this crate
+//! deliberately keeps the surface Inline-only (SPEC §5).
 //!
 //! ## Map of types → SPEC sections
 //!
@@ -15,13 +15,14 @@
 //! | [`auth::MailboxCredential`]    | §5 Axis 2 (Inline) | Parsed `X-Mailbox-Auth` / `X-Mailbox-Imap` / `X-Mailbox-Smtp`. The `Basic` value is never logged. |
 //! | [`auth::Secret`]               | §5, §6         | Redacting wrapper so mailbox passwords never reach logs or disclosures. |
 //! | [`error::GatewayError`]        | §7             | Bounded, machine-readable error codes mapped to HTTP status + a stable `{ code, message }` body. |
+//! | [`imap`]                       | §4, §6         | Provider-facing IMAP client backing the two `read` actions (`search`/`get`). |
 //! | [`smtp::submit`]               | §4, §7         | Build a message (`mail-builder`) and submit it over SMTP (`lettre`), mapping transport failures onto [`GatewayError`]. |
 //! | [`send::SendRequest`]          | §6             | The `POST /email/send` JSON schema, its validation into an `OutgoingMessage`, and the redaction-safe To/From/Subject disclosure. |
 //! | [`pool::ImapPool`]             | §4             | Ephemeral in-memory, per-credential, bounded/LRU/TTL'd cache of warm IMAP sessions; per-request login is the fallback. |
-//! | [`routes::router`]             | §6             | `POST /email/{search,get,send}` — `send` is live over SMTP; `search`/`get` are `not_implemented` stubs. |
+//! | [`routes::router`]             | §6             | `POST /email/{search,get,send}` — all live: `search`/`get` over IMAP, `send` over SMTP. |
 //!
-//! Out of scope for this task (SPEC §5, §11): Portfolio/Session credential
-//! sources, multi-injection, live IMAP/SMTP, and attachments.
+//! Out of scope here (SPEC §5, §11): Portfolio/Session credential sources,
+//! multi-injection, and attachments.
 
 pub mod auth;
 pub mod config;
@@ -43,7 +44,9 @@ pub use pool::{ImapPool, PoolConfig};
 /// Shared application state handed to handlers and middleware.
 ///
 /// Just the immutable [`Config`] today; a connection pool and (optionally) a
-/// Portfolio credential store hang off here in later tasks (SPEC §4).
+/// Portfolio credential store hang off here in later tasks (SPEC §4). Per-request
+/// provider tuning (`ImapSettings` / `SmtpSettings`) is read from the environment
+/// inside each handler rather than stored here.
 pub type AppState = Arc<Config>;
 
 /// Build the full application [`Router`] for the given config.
