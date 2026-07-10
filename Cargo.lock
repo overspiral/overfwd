@@ -857,17 +857,21 @@ dependencies = [
  "async-imap",
  "axum",
  "base64",
+ "futures-util",
  "http-body-util",
  "lettre",
  "mail-builder",
  "mail-parser",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
 ]
 
 [[package]]
