@@ -15,9 +15,11 @@
 //! - Connection / login / TLS failures mapped onto the Foundation [`GatewayError`]
 //!   codes (`auth_failure`, `host_unreachable`, `not_found`, `tls_failure`).
 //!
-//! Deliberately **not** here (separate tasks, SPEC §4/§6): the HTTP routes/schemas,
-//! SMTP submit, and the connection pool. Every call opens its own connection and
-//! logs out — the correct stateless fallback until the pool lands.
+//! Deliberately **not** here (separate tasks, SPEC §4/§6): the HTTP routes/schemas
+//! and SMTP submit. The poolless [`search`]/[`get`] open a fresh connection per call
+//! and log out — the correct stateless fallback (SPEC §4). Their pooled counterparts
+//! [`search_pooled`]/[`get_pooled`] reuse a warm session from the [`crate::pool`]
+//! when one exists and fall back to that same per-request login when it does not.
 //!
 //! ## Choosing TLS
 //!
@@ -43,6 +45,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::auth::{HostPort, MailboxCredential};
 use crate::error::GatewayError;
+use crate::pool::ImapPool;
 
 /// Environment flag: skip TLS certificate verification (self-signed providers such
 /// as the GreenMail e2e stack). Off by default — real providers get real verification.
@@ -287,6 +290,80 @@ async fn get_on(
         .next()
         .ok_or_else(|| GatewayError::NotFound(format!("no message with uid {uid}")))?;
     Ok(parse_full(msg.uid, &msg.raw))
+}
+
+// ---------------------------------------------------------------------------
+// Pooled entry points — reuse a warm session when one is available, else fall back
+// to a fresh per-request LOGIN (SPEC §4 "Connection pooling").
+// ---------------------------------------------------------------------------
+
+/// `search`, amortized: like [`search`] but acquires a warm session from `pool`
+/// when one exists (else logs in fresh), and returns the session to the pool for
+/// reuse when it is still healthy.
+pub async fn search_pooled(
+    pool: &ImapPool,
+    cred: &MailboxCredential,
+    settings: &ImapSettings,
+    mailbox: &str,
+    query: &str,
+) -> Result<Vec<MessageSummary>, GatewayError> {
+    let mut session = acquire(pool, cred, settings).await?;
+    let result = search_on(&mut session, mailbox, query).await;
+    release(pool, cred, session, &result).await;
+    result
+}
+
+/// `get`, amortized: the pooled counterpart of [`get`] (see [`search_pooled`]).
+pub async fn get_pooled(
+    pool: &ImapPool,
+    cred: &MailboxCredential,
+    settings: &ImapSettings,
+    mailbox: &str,
+    uid: u32,
+) -> Result<FullMessage, GatewayError> {
+    let mut session = acquire(pool, cred, settings).await?;
+    let result = get_on(&mut session, mailbox, uid).await;
+    release(pool, cred, session, &result).await;
+    result
+}
+
+/// Obtain a logged-in session for `cred`: a warm one from the pool if available,
+/// otherwise a fresh [`connect_and_login`]. The pool already validates warmth with a
+/// `NOOP`, so the returned session is ready for `SELECT`.
+async fn acquire(
+    pool: &ImapPool,
+    cred: &MailboxCredential,
+    settings: &ImapSettings,
+) -> Result<ImapSession, GatewayError> {
+    if let Some(session) = pool.take_warm(cred).await {
+        return Ok(session);
+    }
+    connect_and_login(cred, settings).await
+}
+
+/// Decide the fate of `session` after an operation. A transport failure
+/// (`host_unreachable` / `tls_failure`) means the connection is suspect, so it is
+/// closed rather than pooled; on success — or a benign application error such as a
+/// missing mailbox/message — the connection is healthy and returned for reuse.
+async fn release<T>(
+    pool: &ImapPool,
+    cred: &MailboxCredential,
+    session: ImapSession,
+    result: &Result<T, GatewayError>,
+) {
+    match result {
+        Err(e) if is_transport_error(e) => logout(session).await,
+        _ => pool.give_back(cred, session).await,
+    }
+}
+
+/// Whether an error implies the underlying connection is no longer trustworthy and
+/// must not be returned to the pool.
+fn is_transport_error(err: &GatewayError) -> bool {
+    matches!(
+        err,
+        GatewayError::HostUnreachable(_) | GatewayError::TlsFailure(_)
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -46,6 +46,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 webpki-roots = "1"
 # Stream combinators for draining async-imap's FETCH result stream.
 futures-util = "0.3"
+# SHA-256 for the connection pool's opaque, credential-keyed handle (SPEC §4
+# pooling): the raw mailbox password is never used as a plaintext map key. `ring`
+# is already the pinned crypto provider (rustls+ring above), so declaring it
+# directly adds no new crate to the build.
+ring = "0.17"
 
 # Support: header decoding, JSON error bodies, structured logging.
 base64 = "0.22"

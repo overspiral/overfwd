@@ -17,15 +17,17 @@
 //! | [`error::GatewayError`]        | §7             | Bounded, machine-readable error codes mapped to HTTP status + a stable `{ code, message }` body. |
 //! | [`smtp::submit`]               | §4, §7         | Build a message (`mail-builder`) and submit it over SMTP (`lettre`), mapping transport failures onto [`GatewayError`]. |
 //! | [`send::SendRequest`]          | §6             | The `POST /email/send` JSON schema, its validation into an `OutgoingMessage`, and the redaction-safe To/From/Subject disclosure. |
+//! | [`pool::ImapPool`]             | §4             | Ephemeral in-memory, per-credential, bounded/LRU/TTL'd cache of warm IMAP sessions; per-request login is the fallback. |
 //! | [`routes::router`]             | §6             | `POST /email/{search,get,send}` — `send` is live over SMTP; `search`/`get` are `not_implemented` stubs. |
 //!
 //! Out of scope for this task (SPEC §5, §11): Portfolio/Session credential
-//! sources, multi-injection, live IMAP/SMTP, the connection pool, and attachments.
+//! sources, multi-injection, live IMAP/SMTP, and attachments.
 
 pub mod auth;
 pub mod config;
 pub mod error;
 pub mod imap;
+pub mod pool;
 pub mod routes;
 pub mod send;
 pub mod smtp;
@@ -36,6 +38,7 @@ use axum::Router;
 
 pub use config::Config;
 pub use error::GatewayError;
+pub use pool::{ImapPool, PoolConfig};
 
 /// Shared application state handed to handlers and middleware.
 ///

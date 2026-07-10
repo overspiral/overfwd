@@ -18,6 +18,7 @@
 
 use overfwd::auth::{HostPort, MailboxCredential, Secret};
 use overfwd::imap::{self, connect, login, uid_search, ImapSettings, TlsMode, DEFAULT_MAILBOX};
+use overfwd::pool::{ImapPool, PoolConfig};
 
 const HOST: &str = "localhost";
 const PLAIN_PORT: u16 = 3143;
@@ -177,6 +178,84 @@ async fn secure_tls_rejects_self_signed_cert() {
         .await
         .expect_err("self-signed cert should be rejected");
     assert_eq!(err.code(), "tls_failure", "got: {err}");
+}
+
+/// Pooled reads reuse a warm connection: after the first `search_pooled` returns a
+/// session to the pool, the second one takes that warm session (validated with NOOP)
+/// instead of logging in afresh — while still returning identical results.
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn pooled_search_reuses_warm_connection() {
+    let c = cred(PLAIN_PORT);
+    let s = insecure();
+    let subject = unique_subject("pool-reuse");
+    append_message(&c, &s, &sample_message(&subject)).await;
+    let query = format!("SUBJECT \"{subject}\"");
+
+    let pool = ImapPool::new(PoolConfig::default());
+    assert_eq!(pool.idle_count(), 0, "pool starts empty");
+
+    // First call: cache miss → fresh login, then the healthy session is pooled.
+    let first = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, &query)
+        .await
+        .expect("first pooled search");
+    assert!(!first.is_empty(), "first search found our message");
+    assert_eq!(pool.idle_count(), 1, "healthy session returned to the pool");
+
+    // Second call: cache hit → the warm session is reused and returned again.
+    let second = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, &query)
+        .await
+        .expect("second pooled search");
+    assert_eq!(
+        first.len(),
+        second.len(),
+        "reused connection yields the same results"
+    );
+    assert_eq!(pool.idle_count(), 1, "session pooled again after reuse");
+
+    // get_pooled shares the same warm session.
+    let uid = second[0].uid;
+    let full = imap::get_pooled(&pool, &c, &s, DEFAULT_MAILBOX, uid)
+        .await
+        .expect("pooled get");
+    assert_eq!(full.uid, uid);
+    assert_eq!(pool.idle_count(), 1);
+}
+
+/// A disabled pool (`max_idle == 0`) never retains a connection: every call falls
+/// back to a fresh per-request login, and the results are still correct (SPEC §4 —
+/// per-request login is the fallback).
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn disabled_pool_falls_back_to_per_request_login() {
+    let c = cred(PLAIN_PORT);
+    let s = insecure();
+
+    let pool = ImapPool::new(PoolConfig::disabled());
+    assert!(!pool.is_enabled());
+
+    let summaries = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, "ALL")
+        .await
+        .expect("search with pooling disabled");
+    // The read still works; nothing is retained.
+    let _ = summaries;
+    assert_eq!(pool.idle_count(), 0, "disabled pool retains nothing");
+}
+
+/// A transport failure must not poison the pool: a `search_pooled` against a dead
+/// port errors as `host_unreachable` and leaves the pool empty (the suspect
+/// connection, if any, is discarded rather than returned).
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn pooled_search_on_dead_port_leaves_pool_empty() {
+    // 3999 has nothing listening on it in the GreenMail stack.
+    let c = cred(3999);
+    let pool = ImapPool::new(PoolConfig::default());
+    let err = imap::search_pooled(&pool, &c, &insecure(), DEFAULT_MAILBOX, "ALL")
+        .await
+        .expect_err("connect should fail");
+    assert_eq!(err.code(), "host_unreachable", "got: {err}");
+    assert_eq!(pool.idle_count(), 0, "nothing pooled on transport failure");
 }
 
 /// Lower-level primitive check: connect + login + UID SEARCH ALL succeeds and the
