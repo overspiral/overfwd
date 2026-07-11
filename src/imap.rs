@@ -38,6 +38,7 @@ use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
 use mail_parser::{Address, MessageParser};
 use serde::Serialize;
+use utoipa::ToSchema;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -181,9 +182,10 @@ pub struct RawMessage {
 ///
 /// Every field beyond `uid` is best-effort: a message that fails to parse still
 /// yields a summary carrying its `uid` with the rest `None`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MessageSummary {
     /// Mailbox-unique id — the handle `get` uses to fetch the full message.
+    #[schema(example = 42)]
     pub uid: u32,
     /// `From` as a display string (`Name <addr>` or bare `addr`).
     pub from: Option<String>,
@@ -199,9 +201,10 @@ pub struct MessageSummary {
 
 /// A full message for `get` (SPEC §6): the summary fields plus decoded bodies and
 /// the original raw bytes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct FullMessage {
     /// Mailbox-unique id.
+    #[schema(example = 42)]
     pub uid: u32,
     /// `From` display string.
     pub from: Option<String>,

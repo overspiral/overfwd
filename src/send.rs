@@ -21,6 +21,7 @@
 //!   surface is the sender-facing summary, and `Bcc` is blind by definition.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::error::GatewayError;
 use crate::smtp::{OutgoingBody, OutgoingMessage};
@@ -34,9 +35,10 @@ pub const BODY_PREVIEW_LIMIT: usize = 256;
 /// `cc`/`bcc` default to empty and `text`/`html` are optional, but at least one of
 /// `text`/`html` must be present and `to` must be non-empty — enforced by
 /// [`SendRequest::into_message`], not by serde.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SendRequest {
     /// Envelope + header `From`.
+    #[schema(example = "sender@example.com")]
     pub from: String,
     /// Primary recipients (`To`). Must be non-empty.
     pub to: Vec<String>,
@@ -47,6 +49,7 @@ pub struct SendRequest {
     #[serde(default)]
     pub bcc: Vec<String>,
     /// The `Subject` header.
+    #[schema(example = "Hello from overfwd")]
     pub subject: String,
     /// A `text/plain` body.
     #[serde(default)]
@@ -94,11 +97,13 @@ impl SendRequest {
 /// The narrow, approval-facing disclosure of a send (SPEC §6): To / From / Subject
 /// and a clamped Body preview. Built from the message, so it can only ever contain
 /// non-secret fields — never the `Basic` auth header or the password.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SendDisclosure {
     pub from: String,
     pub to: Vec<String>,
     pub subject: String,
+    /// The body clamped to [`BODY_PREVIEW_LIMIT`] chars (with an ellipsis when
+    /// truncated). Prefers the `text` part, falling back to `html`.
     pub body_preview: String,
 }
 
@@ -116,9 +121,10 @@ impl SendDisclosure {
 }
 
 /// The `POST /email/send` success response: an acknowledgement plus the disclosure.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SendResponse {
     /// Always `true` on this path — the provider accepted the message (SMTP `250`).
+    #[schema(example = true)]
     pub sent: bool,
     /// The To/From/Subject/body-preview disclosure (SPEC §6).
     pub disclosure: SendDisclosure,

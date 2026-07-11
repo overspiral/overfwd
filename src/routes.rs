@@ -24,15 +24,20 @@ use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
+use utoipa::ToSchema;
 
 use crate::auth::{require_gateway_access, MailboxCredential};
-use crate::error::GatewayError;
+use crate::error::{ErrorResponse, GatewayError};
 use crate::imap::{self, FullMessage, ImapSettings, MessageSummary};
 use crate::send::{SendDisclosure, SendRequest, SendResponse};
 use crate::smtp::{submit, SmtpSettings};
 use crate::AppState;
 
 /// Build the application router for the given shared state (SPEC §6).
+///
+/// The `/email` actions sit behind the Axis-1 gateway-access gate; the OpenAPI docs
+/// ([`crate::openapi::openapi_router`]) are merged **outside** that gate so
+/// `/openapi.json` and `/docs` are reachable without a gateway key (SPEC §5).
 pub fn router(state: AppState) -> Router {
     let email = Router::new()
         .route("/search", post(search))
@@ -44,7 +49,10 @@ pub fn router(state: AppState) -> Router {
             require_gateway_access,
         ));
 
-    Router::new().nest("/email", email).with_state(state)
+    Router::new()
+        .nest("/email", email)
+        .with_state(state)
+        .merge(crate::openapi::openapi_router())
 }
 
 /// Request schema for `POST /email/search` (SPEC §6).
@@ -52,16 +60,19 @@ pub fn router(state: AppState) -> Router {
 /// `query` is a raw IMAP SEARCH key (`ALL`, `UNSEEN`, `SUBJECT "hi"`, …); it is the
 /// caller's responsibility to form a valid key. `criteria` is accepted as an alias.
 /// An absent `query` defaults to `ALL`. `folder` defaults to the mailbox's `INBOX`.
-#[derive(Debug, Deserialize)]
-struct SearchRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct SearchRequest {
     /// Mailbox to search; defaults to [`imap::DEFAULT_MAILBOX`] (`INBOX`).
     #[serde(default)]
+    #[schema(example = "INBOX")]
     folder: Option<String>,
     /// Raw IMAP SEARCH key. Defaults to `ALL`; also accepted as `criteria`.
     #[serde(default = "default_search_query", alias = "criteria")]
+    #[schema(example = "UNSEEN")]
     query: String,
     /// Cap on the number of summaries returned (newest first). `None` = no cap.
     #[serde(default)]
+    #[schema(example = 20)]
     limit: Option<usize>,
 }
 
@@ -74,7 +85,26 @@ fn default_search_query() -> String {
 /// Translates to IMAP SELECT + SEARCH + a light FETCH, returning newest-first
 /// [`MessageSummary`] rows clamped to `limit`. Missing mailbox headers, a malformed
 /// body, and provider failures all surface as typed [`GatewayError`]s (SPEC §7).
-async fn search(
+#[utoipa::path(
+    post,
+    path = "/email/search",
+    tag = "email",
+    request_body = SearchRequest,
+    security(
+        ("gateway_api_key" = []),
+        ("mailbox_auth" = []),
+        ("mailbox_imap" = []),
+        ("mailbox_smtp" = []),
+    ),
+    responses(
+        (status = 200, description = "Newest-first message summaries (clamped to `limit`).", body = Vec<MessageSummary>),
+        (status = 400, description = "`bad_request` — missing/malformed mailbox headers or JSON body.", body = ErrorResponse),
+        (status = 401, description = "`unauthorized` — missing/invalid gateway bearer key (Axis-1).", body = ErrorResponse),
+        (status = 404, description = "`not_found` — the requested mailbox does not exist.", body = ErrorResponse),
+        (status = 502, description = "`auth_failure` / `host_unreachable` / `tls_failure` — the mailbox provider rejected the credential or was unreachable.", body = ErrorResponse),
+    ),
+)]
+pub(crate) async fn search(
     headers: HeaderMap,
     body: Result<Json<SearchRequest>, JsonRejection>,
 ) -> Result<Json<Vec<MessageSummary>>, GatewayError> {
@@ -97,12 +127,14 @@ async fn search(
 }
 
 /// Request schema for `POST /email/get` (SPEC §6). `uid` is required.
-#[derive(Debug, Deserialize)]
-struct GetRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct GetRequest {
     /// Mailbox holding the message; defaults to [`imap::DEFAULT_MAILBOX`] (`INBOX`).
     #[serde(default)]
+    #[schema(example = "INBOX")]
     folder: Option<String>,
     /// The mailbox-unique id of the message to fetch (from a prior `search`).
+    #[schema(example = 42)]
     uid: u32,
 }
 
@@ -111,7 +143,26 @@ struct GetRequest {
 /// Translates to IMAP SELECT + a single FETCH, parsed into a [`FullMessage`]
 /// (headers + text/html body). A `uid` with no matching message maps to
 /// [`GatewayError::NotFound`] by the IMAP layer.
-async fn get(
+#[utoipa::path(
+    post,
+    path = "/email/get",
+    tag = "email",
+    request_body = GetRequest,
+    security(
+        ("gateway_api_key" = []),
+        ("mailbox_auth" = []),
+        ("mailbox_imap" = []),
+        ("mailbox_smtp" = []),
+    ),
+    responses(
+        (status = 200, description = "The full message: headers plus decoded text/html bodies.", body = FullMessage),
+        (status = 400, description = "`bad_request` — missing/malformed mailbox headers or JSON body.", body = ErrorResponse),
+        (status = 401, description = "`unauthorized` — missing/invalid gateway bearer key (Axis-1).", body = ErrorResponse),
+        (status = 404, description = "`not_found` — no message with that `uid` (or the mailbox is missing).", body = ErrorResponse),
+        (status = 502, description = "`auth_failure` / `host_unreachable` / `tls_failure` — the mailbox provider rejected the credential or was unreachable.", body = ErrorResponse),
+    ),
+)]
+pub(crate) async fn get(
     headers: HeaderMap,
     body: Result<Json<GetRequest>, JsonRejection>,
 ) -> Result<Json<FullMessage>, GatewayError> {
@@ -138,7 +189,25 @@ async fn get(
 /// every logged/returned field is drawn from the non-secret disclosure.
 ///
 /// [`Secret`]: crate::auth::Secret
-async fn send(
+#[utoipa::path(
+    post,
+    path = "/email/send",
+    tag = "email",
+    request_body = SendRequest,
+    security(
+        ("gateway_api_key" = []),
+        ("mailbox_auth" = []),
+        ("mailbox_imap" = []),
+        ("mailbox_smtp" = []),
+    ),
+    responses(
+        (status = 200, description = "Accepted by the provider; echoes the To/From/Subject/body-preview disclosure (SPEC §6).", body = SendResponse),
+        (status = 400, description = "`bad_request` — missing/malformed mailbox headers, empty `to`, or no body.", body = ErrorResponse),
+        (status = 401, description = "`unauthorized` — missing/invalid gateway bearer key (Axis-1).", body = ErrorResponse),
+        (status = 502, description = "`auth_failure` / `host_unreachable` / `tls_failure` — the SMTP provider rejected the credential or was unreachable.", body = ErrorResponse),
+    ),
+)]
+pub(crate) async fn send(
     headers: HeaderMap,
     body: Result<Json<SendRequest>, JsonRejection>,
 ) -> Result<Json<SendResponse>, GatewayError> {
