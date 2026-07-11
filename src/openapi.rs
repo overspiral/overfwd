@@ -27,9 +27,7 @@
 
 use axum::routing::get;
 use axum::{Json, Router};
-use utoipa::openapi::security::{
-    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
-};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 

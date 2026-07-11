@@ -38,11 +38,11 @@ use async_imap::{Client, Session};
 use futures_util::TryStreamExt;
 use mail_parser::{Address, MessageParser};
 use serde::Serialize;
-use utoipa::ToSchema;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use utoipa::ToSchema;
 
 use crate::auth::{HostPort, MailboxCredential};
 use crate::error::GatewayError;
