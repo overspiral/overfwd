@@ -1,7 +1,11 @@
 //! Integration tests for the HTTP spine (SPEC §5–7).
 //!
 //! Drives the router in-process with `tower::ServiceExt::oneshot` — no live mail
-//! and no bound socket needed.
+//! and no bound socket needed. All three actions are live, so the non-ignored tests
+//! here exercise the request-validation paths that are rejected *before* any IMAP or
+//! SMTP connection is attempted (missing credential, malformed body, missing field);
+//! the live happy paths live in the `#[ignore]`d GreenMail tests (this file's `send`
+//! test plus `tests/routes_e2e.rs` for the reads).
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -31,16 +35,13 @@ fn post(path: &str) -> Request<Body> {
         .unwrap()
 }
 
-#[tokio::test]
-async fn stub_routes_return_501_with_typed_error() {
-    // `send` is live now; only the read actions remain stubs.
-    for path in ["/email/search", "/email/get"] {
-        let response = app(config(false, None)).oneshot(post(path)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
-        let json = body_json(response).await;
-        assert_eq!(json["code"], "not_implemented", "{path}");
-        assert!(json["message"].is_string(), "{path}");
-    }
+fn json_post(path: &str, body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -52,14 +53,76 @@ async fn unknown_route_is_404() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+// --- Read routes: request validation (rejected before any IMAP connection) -------
+
+/// A read route with no mailbox headers is rejected with a typed `bad_request`
+/// before any IMAP connection is attempted (SPEC §5 Axis 2, §7). This exercises the
+/// wiring without needing a live mail server.
+#[tokio::test]
+async fn read_routes_without_mailbox_headers_are_bad_request() {
+    // `/email/search` — all body fields default, so it is the credential that is
+    // missing; `/email/get` additionally requires a `uid` in the body.
+    let cases = [
+        ("/email/search", json_post("/email/search", "{}")),
+        ("/email/get", json_post("/email/get", r#"{"uid":1}"#)),
+    ];
+    for (name, request) in cases {
+        let response = app(config(false, None)).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        assert_eq!(body_json(response).await["code"], "bad_request", "{name}");
+    }
+}
+
+/// A malformed JSON body yields the gateway's typed `bad_request`, not axum's
+/// untyped `Json` rejection (SPEC §7). Mailbox headers are present so the failure is
+/// unambiguously the body, not the credential.
+#[tokio::test]
+async fn invalid_json_body_is_typed_bad_request() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from("not json"))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "bad_request");
+}
+
+/// `/email/get` without the required `uid` is a typed `bad_request` (SPEC §6, §7),
+/// even when a valid mailbox credential is present — no IMAP call is attempted.
+#[tokio::test]
+async fn get_without_uid_is_bad_request() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/get")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "bad_request");
+}
+
+// --- Axis-1 gateway-access gate (SPEC §5) ---------------------------------------
+
 #[tokio::test]
 async fn api_key_not_enforced_when_toggle_off() {
-    // No Authorization header, require_api_key=false → passes gate, reaches 501 stub.
+    // require_api_key=false → the gate is a no-op. With no mailbox headers the
+    // request reaches the handler and is rejected there for the *credential*
+    // (bad_request), proving the gate did not reject it (which would be 401).
     let response = app(config(false, None))
         .oneshot(post("/email/search"))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "bad_request");
 }
 
 #[tokio::test]
@@ -86,6 +149,27 @@ async fn api_key_enforced_rejects_wrong_bearer() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn api_key_enforced_accepts_correct_bearer() {
+    // Correct key → passes the Axis-1 gate. With no mailbox headers the handler then
+    // rejects for the missing credential (bad_request) — a 400 (not 401) proves the
+    // gate accepted the key, without opening a live IMAP connection.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header("Authorization", "Bearer the-key")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(config(true, Some("the-key")))
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "bad_request");
+}
+
+// --- Send route: request validation (rejected before submit) --------------------
 
 /// A `POST /email/send` carrying valid Inline mailbox headers and the given JSON
 /// body. The SMTP target points at a dead port so any test that *reaches* the
@@ -150,25 +234,6 @@ async fn send_with_malformed_json_is_bad_request() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(response).await["code"], "bad_request");
-}
-
-#[tokio::test]
-async fn api_key_enforced_accepts_correct_bearer() {
-    // Correct key → passes the Axis-1 gate; then hits the not-yet-implemented stub.
-    let request = Request::builder()
-        .method("POST")
-        .uri("/email/search")
-        .header("Authorization", "Bearer the-key")
-        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
-        .header(H_MAILBOX_IMAP, "localhost:3143")
-        .header(H_MAILBOX_SMTP, "localhost:3025")
-        .body(Body::empty())
-        .unwrap();
-    let response = app(config(true, Some("the-key")))
-        .oneshot(request)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 /// End-to-end happy path for `POST /email/send` against the shared GreenMail stack.
