@@ -1,5 +1,5 @@
 //! End-to-end suite closing overfwd **v0** (SPEC §4–§7): the whole REST → IMAP/SMTP
-//! path exercised against the shared **GreenMail** stack (`README.md`, `compose.yml`).
+//! path exercised against the shared **GreenMail** stack (`docs/testing.md`, `compose.yml`).
 //!
 //! Unlike the per-module `#[ignore]`d GreenMail tests (`imap_e2e`, `smtp_greenmail`,
 //! `routes_e2e`), this suite is a **plain `cargo test`** citizen: every test probes
@@ -27,10 +27,10 @@
 //!
 //! ## Isolation on the shared stack
 //!
-//! The GreenMail stack is **shared across worktrees** (`README.md`), so this suite
+//! The GreenMail stack is **shared across worktrees** (`docs/testing.md`), so this suite
 //! never issues a global `POST /api/service/reset` from a test body — that would wipe
 //! a sibling run's mail mid-flight. It isolates instead with a **unique subject per
-//! test** (the README-sanctioned alternative). `make mail-reset` remains the operator
+//! test** (the docs/testing.md-sanctioned alternative). `make mail-reset` remains the operator
 //! step *between* whole runs.
 
 use std::sync::{Arc, Mutex, OnceLock};
@@ -82,7 +82,7 @@ macro_rules! require_stack {
     };
 }
 
-/// `true` once GreenMail's management API answers readiness (SPEC — `README.md`).
+/// `true` once GreenMail's management API answers readiness (SPEC — `docs/testing.md`).
 /// A single container hosts SMTP/IMAP and the API, so this gate covers the whole stack.
 async fn stack_ready() -> bool {
     matches!(
@@ -92,7 +92,7 @@ async fn stack_ready() -> bool {
 }
 
 /// A tiny dependency-free HTTP/1.0 client for GreenMail's management API on `:8080`
-/// (`README.md`). Returns `(status, body)`, or `None` if the endpoint is unreachable.
+/// (`docs/testing.md`). Returns `(status, body)`, or `None` if the endpoint is unreachable.
 /// HTTP/1.0 + `Connection: close` lets us read to EOF without parsing `Content-Length`.
 async fn mgmt_request(method: &str, path: &str) -> Option<(u16, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -152,7 +152,7 @@ fn gateway_config() -> Config {
 }
 
 /// A distinct, greppable subject per test so runs stay independent on the shared,
-/// un-reset stack (`README.md`). The pid varies per run, so leftovers never collide.
+/// un-reset stack (`docs/testing.md`). The pid varies per run, so leftovers never collide.
 fn unique(tag: &str) -> String {
     format!("overfwd-v0-e2e-{tag}-{}", std::process::id())
 }
