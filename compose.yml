@@ -10,7 +10,7 @@
 # not a port collision. (Top-level `name:` is intentionally omitted: legacy
 # docker-compose v1 rejects it; `-p` works on v1, Compose v2, and podman-compose.)
 # Do NOT start a second stack per worktree — reset state instead
-# (make mail-reset / POST /api/service/reset). See README.md.
+# (make mail-reset / POST /api/service/reset). See docs/testing.md.
 
 services:
   greenmail:
