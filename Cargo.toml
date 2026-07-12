@@ -52,6 +52,14 @@ futures-util = "0.3"
 # directly adds no new crate to the build.
 ring = "0.17"
 
+# Code-derived OpenAPI 3.1 (SPEC §6/§7). utoipa generates the spec from the real
+# request/response types via `ToSchema`/`#[utoipa::path]` derives, so the document
+# can't drift from the handlers. Pure Rust — no system OpenSSL, matching the
+# rustls/ring stance above. `axum_extras` teaches the path macro about axum
+# extractors; swagger-ui's `axum` feature yields a mountable `Router`.
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
 # Support: header decoding, JSON error bodies, structured logging.
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

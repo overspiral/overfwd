@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// The gateway's bounded, typed error set (SPEC §7).
 ///
@@ -91,17 +92,30 @@ impl std::fmt::Display for GatewayError {
 impl std::error::Error for GatewayError {}
 
 /// The stable JSON error body (SPEC §7): `{ "code": ..., "message": ... }`.
-#[derive(Serialize)]
-struct ErrorBody<'a> {
-    code: &'a str,
-    message: &'a str,
+///
+/// This is the single wire shape every [`GatewayError`] serialises to, so the
+/// OpenAPI schema derived here (via [`ToSchema`]) is the real response envelope and
+/// cannot drift from what the gateway actually returns. `code` is one of the stable
+/// strings from [`GatewayError::code`]; `message` is human-readable and never
+/// carries a secret (SPEC §6).
+#[derive(Serialize, ToSchema)]
+pub struct ErrorResponse {
+    /// Stable, machine-readable code — one of `bad_request`, `unauthorized`,
+    /// `auth_failure`, `host_unreachable`, `not_found`, `tls_failure`,
+    /// `not_implemented` (SPEC §7).
+    #[schema(example = "not_found")]
+    pub code: String,
+    /// Human-readable detail. Never contains the `X-Mailbox-Auth` value or a
+    /// mailbox password (SPEC §6).
+    #[schema(example = "mailbox 'INBOX' not found")]
+    pub message: String,
 }
 
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        let body = ErrorBody {
-            code: self.code(),
-            message: self.message(),
+        let body = ErrorResponse {
+            code: self.code().to_string(),
+            message: self.message().to_string(),
         };
         (self.status(), Json(body)).into_response()
     }
