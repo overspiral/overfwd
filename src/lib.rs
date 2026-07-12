@@ -26,6 +26,7 @@
 //! multi-injection, and attachments.
 
 pub mod auth;
+pub mod autoconfig;
 pub mod config;
 pub mod error;
 pub mod imap;
@@ -39,24 +40,36 @@ use std::sync::Arc;
 
 use axum::Router;
 
+pub use autoconfig::Autoconfig;
 pub use config::Config;
 pub use error::GatewayError;
 pub use pool::{ImapPool, PoolConfig};
 
 /// Shared application state handed to handlers and middleware.
 ///
-/// Just the immutable [`Config`] today; a connection pool and (optionally) a
-/// Portfolio credential store hang off here in later tasks (SPEC §4). Per-request
-/// provider tuning (`ImapSettings` / `SmtpSettings`) is read from the environment
-/// inside each handler rather than stored here.
-pub type AppState = Arc<Config>;
+/// Holds the immutable [`Config`] plus the [`Autoconfig`] resolver used to derive a
+/// provider `host:port` from the user's domain when the `X-Mailbox-*` host headers are
+/// absent (SPEC §5). A connection pool and (optionally) a Portfolio credential store
+/// hang off here in later tasks (SPEC §4). Per-request provider tuning (`ImapSettings`
+/// / `SmtpSettings`) is read from the environment inside each handler.
+#[derive(Clone)]
+pub struct AppState {
+    /// Immutable, process-wide gateway configuration.
+    pub config: Arc<Config>,
+    /// Domain→provider autoconfiguration resolver (with its in-memory cache).
+    pub autoconfig: Arc<Autoconfig>,
+}
 
 /// Build the full application [`Router`] for the given config.
 ///
-/// The `/email/*` routes are wrapped with the Axis-1 gateway-access middleware
-/// ([`auth::require_gateway_access`]); the middleware is a no-op when
+/// The [`Autoconfig`] resolver is built once from the environment and shared across
+/// requests. The `/email/*` routes are wrapped with the Axis-1 gateway-access
+/// middleware ([`auth::require_gateway_access`]); the middleware is a no-op when
 /// `require_api_key` is false (SPEC §5, §10 self-host).
 pub fn app(config: Config) -> Router {
-    let state: AppState = Arc::new(config);
+    let state = AppState {
+        config: Arc::new(config),
+        autoconfig: Arc::new(Autoconfig::from_env()),
+    };
     routes::router(state)
 }

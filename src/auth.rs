@@ -3,9 +3,11 @@
 //! - **Axis 1 — Gateway access.** [`require_gateway_access`] checks
 //!   `Authorization: Bearer <api_key>` against the single static configured key,
 //!   enforced only when `require_api_key` is set.
-//! - **Axis 2 — Mailbox credential (Inline only).** [`MailboxCredential`] parses the
-//!   `X-Mailbox-*` headers into a struct. Portfolio (`X-Mailbox-Account`) and
-//!   Session sources are out of scope here (SPEC §5, §11).
+//! - **Axis 2 — Mailbox credential (Inline only).** [`InlineHeaders::parse`] reads the
+//!   `X-Mailbox-*` headers; [`InlineHeaders::into_credential`] then resolves them into
+//!   a [`MailboxCredential`], deriving any absent host target from the user's domain
+//!   via [`crate::autoconfig`]. Portfolio (`X-Mailbox-Account`) and Session sources are
+//!   out of scope here (SPEC §5, §11).
 //!
 //! `Authorization` is reserved for the gateway key; the mailbox concern lives
 //! entirely in `X-Mailbox-*`, so the two axes never collide (SPEC §5).
@@ -21,6 +23,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
 
+use crate::autoconfig::Autoconfig;
 use crate::error::GatewayError;
 use crate::AppState;
 
@@ -30,6 +33,10 @@ pub const H_MAILBOX_AUTH: &str = "X-Mailbox-Auth";
 pub const H_MAILBOX_IMAP: &str = "X-Mailbox-Imap";
 /// Header carrying the non-secret SMTP target: `host:port` (SPEC §5).
 pub const H_MAILBOX_SMTP: &str = "X-Mailbox-Smtp";
+/// Optional header naming the domain to autoconfigure from when the `X-Mailbox-Imap`
+/// / `X-Mailbox-Smtp` targets are absent. Overrides the domain otherwise taken from
+/// the mailbox username's `@` — and lets a short login-id (no `@`) autoconfigure.
+pub const H_MAILBOX_DOMAIN: &str = "X-Mailbox-Domain";
 
 /// A redacting wrapper for secret strings (mailbox password, gateway api_key).
 ///
@@ -94,11 +101,13 @@ impl HostPort {
     }
 }
 
-/// An Inline mailbox credential parsed from the `X-Mailbox-*` headers (SPEC §5 Axis 2).
+/// A fully-resolved Inline mailbox credential (SPEC §5 Axis 2).
 ///
-/// A single credential covers **both** IMAP and SMTP (SPEC §5). The `password` is
-/// held in [`Secret`]; `Debug` on this struct redacts it, so the original `Basic`
-/// value can't be reconstructed from a log line (SPEC §6).
+/// Produced by [`InlineHeaders::into_credential`] once both host targets are known
+/// (supplied on the wire or filled from autoconfiguration). A single credential covers
+/// **both** IMAP and SMTP (SPEC §5). The `password` is held in [`Secret`]; `Debug` on
+/// this struct redacts it, so the original `Basic` value can't be reconstructed from a
+/// log line (SPEC §6).
 #[derive(Clone)]
 pub struct MailboxCredential {
     /// The mailbox login id (the part before `:` in the decoded `Basic` value).
@@ -122,29 +131,141 @@ impl std::fmt::Debug for MailboxCredential {
     }
 }
 
-impl MailboxCredential {
-    /// Parse the Inline credential from request headers (SPEC §5 Axis 2, §6 wire layout).
+/// The Inline mailbox headers as parsed off the wire, **before** autoconfiguration.
+///
+/// `X-Mailbox-Auth` is always required; the host targets are optional and, when
+/// absent, filled from the user's domain by [`InlineHeaders::into_credential`]
+/// (SPEC §5). Keeping the parse (pure, sync) separate from the resolve (async,
+/// possibly network) keeps the fast path — both headers present — allocation- and
+/// I/O-free, and makes the resolve independently testable.
+#[derive(Clone)]
+pub struct InlineHeaders {
+    /// Mailbox login id (part before `:` in the decoded `Basic` value).
+    pub username: String,
+    /// Mailbox password — never logged.
+    pub password: Secret,
+    /// IMAP target, if `X-Mailbox-Imap` was present.
+    pub imap: Option<HostPort>,
+    /// SMTP target, if `X-Mailbox-Smtp` was present.
+    pub smtp: Option<HostPort>,
+    /// Explicit autoconfig domain from `X-Mailbox-Domain`, if present.
+    pub domain: Option<String>,
+}
+
+impl std::fmt::Debug for InlineHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineHeaders")
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .field("imap", &self.imap)
+            .field("smtp", &self.smtp)
+            .field("domain", &self.domain)
+            .finish()
+    }
+}
+
+impl InlineHeaders {
+    /// Parse the Inline headers (SPEC §5 Axis 2, §6 wire layout).
     ///
-    /// Requires all three of `X-Mailbox-Auth`, `X-Mailbox-Imap`, `X-Mailbox-Smtp`.
-    /// Any missing/malformed header yields [`GatewayError::BadRequest`]. Errors never
-    /// include the `Basic` value.
-    pub fn from_headers(headers: &HeaderMap) -> Result<Self, GatewayError> {
+    /// `X-Mailbox-Auth` is required; `X-Mailbox-Imap`, `X-Mailbox-Smtp`, and
+    /// `X-Mailbox-Domain` are optional (a present-but-malformed one still errors).
+    /// Errors never include the `Basic` value.
+    pub fn parse(headers: &HeaderMap) -> Result<Self, GatewayError> {
         let auth = required_str(headers, H_MAILBOX_AUTH)?;
         let (username, password) = parse_basic(&auth)?;
 
-        let imap = HostPort::parse(H_MAILBOX_IMAP, &required_str(headers, H_MAILBOX_IMAP)?)?;
-        let smtp = HostPort::parse(H_MAILBOX_SMTP, &required_str(headers, H_MAILBOX_SMTP)?)?;
+        let imap = optional_host_port(headers, H_MAILBOX_IMAP)?;
+        let smtp = optional_host_port(headers, H_MAILBOX_SMTP)?;
+        let domain = optional_str(headers, H_MAILBOX_DOMAIN)?
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
 
-        Ok(MailboxCredential {
+        Ok(InlineHeaders {
             username,
             password,
+            imap,
+            smtp,
+            domain,
+        })
+    }
+
+    /// The autoconfig domain: the explicit `X-Mailbox-Domain` override, else the
+    /// username's `@domain`. `None` when neither is available.
+    fn autoconfig_domain(&self) -> Option<String> {
+        self.domain.clone().or_else(|| {
+            self.username
+                .rsplit_once('@')
+                .map(|(_, d)| d.to_ascii_lowercase())
+                .filter(|d| !d.is_empty())
+        })
+    }
+
+    /// Resolve into a complete [`MailboxCredential`], filling any absent host target
+    /// from autoconfiguration (SPEC §5).
+    ///
+    /// Fast path: when both host headers are present, no lookup happens. Otherwise the
+    /// domain (override or username `@domain`) drives [`Autoconfig::resolve`]; an
+    /// explicitly-supplied header always wins over the resolved value. Yields
+    /// [`GatewayError::BadRequest`] when there is no domain to resolve (or autoconfig
+    /// is disabled), and [`GatewayError::AutoconfigFailed`] when the lookup finds no
+    /// usable endpoint for the needed side.
+    pub async fn into_credential(
+        self,
+        autoconfig: &Autoconfig,
+    ) -> Result<MailboxCredential, GatewayError> {
+        // Fast path — nothing to resolve.
+        if let (Some(imap), Some(smtp)) = (self.imap.clone(), self.smtp.clone()) {
+            return Ok(MailboxCredential {
+                username: self.username,
+                password: self.password,
+                imap,
+                smtp,
+            });
+        }
+
+        if !autoconfig.enabled() {
+            return Err(GatewayError::BadRequest(missing_target_message()));
+        }
+
+        let domain = self.autoconfig_domain().ok_or_else(|| {
+            GatewayError::BadRequest(format!(
+                "{missing}; cannot autoconfigure without a domain — supply the host header(s) or {H_MAILBOX_DOMAIN}",
+                missing = missing_target_message(),
+            ))
+        })?;
+
+        // Pass a full address to provider-hosted autoconfig only when we can form one.
+        let email = if self.username.contains('@') {
+            Some(self.username.clone())
+        } else {
+            self.domain
+                .as_ref()
+                .map(|d| format!("{}@{}", self.username, d))
+        };
+
+        let servers = autoconfig.resolve(&domain, email.as_deref()).await?;
+
+        let imap = self.imap.clone().or(servers.imap).ok_or_else(|| {
+            GatewayError::AutoconfigFailed(format!("no IMAP endpoint resolved for '{domain}'"))
+        })?;
+        let smtp = self.smtp.clone().or(servers.smtp).ok_or_else(|| {
+            GatewayError::AutoconfigFailed(format!("no SMTP endpoint resolved for '{domain}'"))
+        })?;
+
+        Ok(MailboxCredential {
+            username: self.username,
+            password: self.password,
             imap,
             smtp,
         })
     }
 }
 
-/// Read a required header as a `&str`, erroring if absent or non-ASCII.
+fn missing_target_message() -> String {
+    format!("missing {H_MAILBOX_IMAP} and/or {H_MAILBOX_SMTP} header")
+}
+
+/// Read a required header as a `String`, erroring if absent or non-ASCII.
 fn required_str(headers: &HeaderMap, name: &str) -> Result<String, GatewayError> {
     let value = headers
         .get(name)
@@ -153,6 +274,25 @@ fn required_str(headers: &HeaderMap, name: &str) -> Result<String, GatewayError>
         .to_str()
         .map(|s| s.to_string())
         .map_err(|_| GatewayError::BadRequest(format!("{name} is not valid ASCII")))
+}
+
+/// Read an optional header as a `String`, erroring only if present-but-non-ASCII.
+fn optional_str(headers: &HeaderMap, name: &str) -> Result<Option<String>, GatewayError> {
+    match headers.get(name) {
+        None => Ok(None),
+        Some(value) => value
+            .to_str()
+            .map(|s| Some(s.to_string()))
+            .map_err(|_| GatewayError::BadRequest(format!("{name} is not valid ASCII"))),
+    }
+}
+
+/// Parse an optional `host:port` header (absent → `None`; malformed → error).
+fn optional_host_port(headers: &HeaderMap, name: &str) -> Result<Option<HostPort>, GatewayError> {
+    match optional_str(headers, name)? {
+        None => Ok(None),
+        Some(raw) => Ok(Some(HostPort::parse(name, &raw)?)),
+    }
 }
 
 /// Parse a `Basic base64(user:pass)` value into `(username, Secret(password))`.
@@ -187,15 +327,16 @@ fn parse_basic(value: &str) -> Result<(String, Secret), GatewayError> {
 /// `Authorization: Bearer <api_key>` matching the single configured key, else
 /// [`GatewayError::Unauthorized`].
 pub async fn require_gateway_access(
-    State(config): State<AppState>,
+    State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, GatewayError> {
-    if !config.require_api_key {
+    if !state.config.require_api_key {
         return Ok(next.run(request).await);
     }
 
-    let expected = config
+    let expected = state
+        .config
         .api_key
         .as_ref()
         // Config::from_env guarantees this is Some when require_api_key is true.
@@ -323,24 +464,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_headers_requires_all_three() {
+    use crate::autoconfig::testing;
+
+    /// Build headers with the auth header plus any extra (name, value) pairs.
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        use axum::http::HeaderName;
         let mut headers = HeaderMap::new();
         headers.insert(H_MAILBOX_AUTH, basic("test", "test").parse().unwrap());
-        // Missing IMAP/SMTP → bad_request.
+        for (name, value) in pairs {
+            let name: HeaderName = name.parse().unwrap();
+            headers.insert(name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn parse_makes_host_headers_optional() {
+        let headers = headers_with(&[]);
+        let parsed = InlineHeaders::parse(&headers).unwrap();
+        assert_eq!(parsed.username, "test");
+        assert!(parsed.imap.is_none());
+        assert!(parsed.smtp.is_none());
+        assert!(parsed.domain.is_none());
+    }
+
+    #[test]
+    fn parse_still_rejects_a_malformed_host_header() {
+        // Present-but-malformed IMAP header is a bad_request even though it's optional.
+        let headers = headers_with(&[(H_MAILBOX_IMAP, "localhost")]);
         assert_eq!(
-            MailboxCredential::from_headers(&headers)
-                .unwrap_err()
-                .code(),
+            InlineHeaders::parse(&headers).unwrap_err().code(),
             "bad_request"
         );
+    }
 
-        headers.insert(H_MAILBOX_IMAP, "localhost:3143".parse().unwrap());
-        headers.insert(H_MAILBOX_SMTP, "localhost:3025".parse().unwrap());
-        let cred = MailboxCredential::from_headers(&headers).unwrap();
-        assert_eq!(cred.username, "test");
+    #[tokio::test]
+    async fn both_headers_present_resolves_without_lookup() {
+        let headers = headers_with(&[
+            (H_MAILBOX_IMAP, "localhost:3143"),
+            (H_MAILBOX_SMTP, "localhost:3025"),
+        ]);
+        // A disabled resolver proves the fast path never consults autoconfig.
+        let cred = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::disabled())
+            .await
+            .unwrap();
         assert_eq!(cred.imap.port, 3143);
         assert_eq!(cred.smtp.port, 3025);
+    }
+
+    #[tokio::test]
+    async fn missing_target_without_a_domain_is_bad_request() {
+        // Username `test` has no `@` and no X-Mailbox-Domain → nothing to autoconfigure.
+        let headers = headers_with(&[]);
+        let err = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::empty())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "bad_request");
+    }
+
+    #[tokio::test]
+    async fn autoconfig_fills_both_targets_from_username_domain() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            H_MAILBOX_AUTH,
+            basic("jane@fastmail.com", "pw").parse().unwrap(),
+        );
+        let cred = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::ispdb("fastmail.com", testing::FASTMAIL_XML))
+            .await
+            .unwrap();
+        assert_eq!(cred.imap.host, "imap.fastmail.com");
+        assert_eq!(cred.imap.port, 993);
+        assert_eq!(cred.smtp.port, 465);
+    }
+
+    #[tokio::test]
+    async fn domain_header_enables_a_short_login_id() {
+        // Login id `test` (no `@`) autoconfigures via the explicit domain header.
+        let headers = headers_with(&[(H_MAILBOX_DOMAIN, "fastmail.com")]);
+        let cred = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::ispdb("fastmail.com", testing::FASTMAIL_XML))
+            .await
+            .unwrap();
+        assert_eq!(cred.imap.host, "imap.fastmail.com");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_host_header_overrides_autoconfig() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            H_MAILBOX_AUTH,
+            basic("jane@fastmail.com", "pw").parse().unwrap(),
+        );
+        headers.insert(H_MAILBOX_IMAP, "imap.override.test:1993".parse().unwrap());
+        let cred = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::ispdb("fastmail.com", testing::FASTMAIL_XML))
+            .await
+            .unwrap();
+        // IMAP from the header, SMTP filled from autoconfig.
+        assert_eq!(cred.imap.host, "imap.override.test");
+        assert_eq!(cred.imap.port, 1993);
+        assert_eq!(cred.smtp.host, "smtp.fastmail.com");
+    }
+
+    #[tokio::test]
+    async fn disabled_autoconfig_keeps_missing_target_a_bad_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            H_MAILBOX_AUTH,
+            basic("jane@fastmail.com", "pw").parse().unwrap(),
+        );
+        let err = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::disabled())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "bad_request");
     }
 
     #[test]

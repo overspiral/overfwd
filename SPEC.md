@@ -142,11 +142,24 @@ e.g. Migadu). The mailbox host/port are **non-secret** and travel as config, not
 ```
 Authorization: Bearer <api_key>              # gateway access (axis 1)
 X-Mailbox-Auth:  Basic base64(user:pass)     # mailbox credential — Inline (axis 2)
-X-Mailbox-Imap:  <host>:<port>               # non-secret provider target
-X-Mailbox-Smtp:  <host>:<port>               # non-secret provider target
+X-Mailbox-Imap:  <host>:<port>               # non-secret provider target (optional — see below)
+X-Mailbox-Smtp:  <host>:<port>               # non-secret provider target (optional — see below)
+X-Mailbox-Domain: <domain>                   # optional: domain to autoconfigure from
 # — or, in Portfolio mode, instead of X-Mailbox-Auth/Imap/Smtp: —
 X-Mailbox-Account: <account_id>
 ```
+
+**Autoconfiguration fallback.** `X-Mailbox-Imap` / `X-Mailbox-Smtp` are optional. When a
+host header is absent, the gateway derives `host:port` from the user's **domain** via email
+autoconfiguration (Mozilla autoconfig — provider-hosted, `.well-known`, and the Thunderbird
+ISPDB — then RFC 6186 DNS SRV / MX), the way a mail client does. The domain is taken from the
+mailbox username's `@`, or from an explicit `X-Mailbox-Domain` (which also lets a short
+login-id with no `@` autoconfigure). An explicitly-supplied host header always wins over the
+resolved value. Results are cached in-memory only (never persisted — zero-persistence stays
+honest). Only the §8 standard-IMAP long tail is in scope; the resolver prefers implicit-TLS
+endpoints (IMAP `993` / SMTP `465`). When no target can be resolved the request fails with the
+`autoconfig_failed` code (§7); when there is no domain to resolve at all it stays a
+`bad_request`. Autoconfiguration is on by default and can be disabled by config.
 
 A consumer that fronts many tenants (e.g. Overslash) can use a **single static gateway
 api_key** for its own identity; its tenancy is carried per-request by the differing mailbox
@@ -186,6 +199,7 @@ Bounded, typed, machine-readable error codes a caller can gate/approve/branch on
 - **host unreachable** (provider IMAP/SMTP down or wrong host/port)
 - **mailbox / message not found**
 - **TLS failure**
+- **autoconfig failed** (host headers absent and no provider target resolvable from the domain)
 
 Codes are stable across gateway instances and versions.
 

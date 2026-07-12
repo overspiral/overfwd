@@ -20,13 +20,14 @@
 //! - `get` → SELECT + a single BODY.PEEK FETCH, parsed into a [`FullMessage`].
 
 use axum::extract::rejection::JsonRejection;
+use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::auth::{require_gateway_access, MailboxCredential};
+use crate::auth::{require_gateway_access, InlineHeaders};
 use crate::error::{ErrorResponse, GatewayError};
 use crate::imap::{self, FullMessage, ImapSettings, MessageSummary};
 use crate::send::{SendDisclosure, SendRequest, SendResponse};
@@ -105,10 +106,13 @@ fn default_search_query() -> String {
     ),
 )]
 pub(crate) async fn search(
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<SearchRequest>, JsonRejection>,
 ) -> Result<Json<Vec<MessageSummary>>, GatewayError> {
-    let credential = MailboxCredential::from_headers(&headers)?;
+    let credential = InlineHeaders::parse(&headers)?
+        .into_credential(&state.autoconfig)
+        .await?;
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
@@ -163,10 +167,13 @@ pub(crate) struct GetRequest {
     ),
 )]
 pub(crate) async fn get(
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<GetRequest>, JsonRejection>,
 ) -> Result<Json<FullMessage>, GatewayError> {
-    let credential = MailboxCredential::from_headers(&headers)?;
+    let credential = InlineHeaders::parse(&headers)?
+        .into_credential(&state.autoconfig)
+        .await?;
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
@@ -208,10 +215,13 @@ pub(crate) async fn get(
     ),
 )]
 pub(crate) async fn send(
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<SendRequest>, JsonRejection>,
 ) -> Result<Json<SendResponse>, GatewayError> {
-    let credential = MailboxCredential::from_headers(&headers)?;
+    let credential = InlineHeaders::parse(&headers)?
+        .into_credential(&state.autoconfig)
+        .await?;
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
