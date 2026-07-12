@@ -8,7 +8,8 @@
 //! SPEC §7 mandates at least: `auth_failure`, `host_unreachable`, `not_found`,
 //! `tls_failure`. `bad_request` and `unauthorized` cover the gateway's own request
 //! validation and Axis-1 access. `not_implemented` backs the v1 route stubs until
-//! the real IMAP/SMTP bodies land.
+//! the real IMAP/SMTP bodies land. `autoconfig_failed` covers the domain→provider
+//! autoconfiguration path (missing host headers resolved from the user's domain).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -34,6 +35,11 @@ pub enum GatewayError {
     NotFound(String),
     /// TLS negotiation with the provider failed. → 502
     TlsFailure(String),
+    /// The `X-Mailbox-Imap`/`-Smtp` host headers were absent and the provider
+    /// target could not be resolved from the user's domain via autoconfiguration
+    /// (no config published, lookup failed, or no implicit-TLS endpoint offered).
+    /// A caller can recover by supplying the host headers explicitly. → 502
+    AutoconfigFailed(String),
     /// The action is registered but not yet implemented (v1 stubs). → 501
     NotImplemented(String),
 }
@@ -48,6 +54,7 @@ impl GatewayError {
             GatewayError::HostUnreachable(_) => "host_unreachable",
             GatewayError::NotFound(_) => "not_found",
             GatewayError::TlsFailure(_) => "tls_failure",
+            GatewayError::AutoconfigFailed(_) => "autoconfig_failed",
             GatewayError::NotImplemented(_) => "not_implemented",
         }
     }
@@ -65,6 +72,7 @@ impl GatewayError {
             GatewayError::HostUnreachable(_) => StatusCode::BAD_GATEWAY,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
             GatewayError::TlsFailure(_) => StatusCode::BAD_GATEWAY,
+            GatewayError::AutoconfigFailed(_) => StatusCode::BAD_GATEWAY,
             GatewayError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
         }
     }
@@ -78,6 +86,7 @@ impl GatewayError {
             | GatewayError::HostUnreachable(m)
             | GatewayError::NotFound(m)
             | GatewayError::TlsFailure(m)
+            | GatewayError::AutoconfigFailed(m)
             | GatewayError::NotImplemented(m) => m,
         }
     }
@@ -102,7 +111,7 @@ impl std::error::Error for GatewayError {}
 pub struct ErrorResponse {
     /// Stable, machine-readable code — one of `bad_request`, `unauthorized`,
     /// `auth_failure`, `host_unreachable`, `not_found`, `tls_failure`,
-    /// `not_implemented` (SPEC §7).
+    /// `autoconfig_failed`, `not_implemented` (SPEC §7).
     #[schema(example = "not_found")]
     pub code: String,
     /// Human-readable detail. Never contains the `X-Mailbox-Auth` value or a
@@ -147,6 +156,11 @@ mod tests {
             ),
             (GatewayError::NotFound(String::new()), "not_found", 404),
             (GatewayError::TlsFailure(String::new()), "tls_failure", 502),
+            (
+                GatewayError::AutoconfigFailed(String::new()),
+                "autoconfig_failed",
+                502,
+            ),
             (
                 GatewayError::NotImplemented(String::new()),
                 "not_implemented",

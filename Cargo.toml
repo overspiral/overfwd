@@ -60,6 +60,33 @@ ring = "0.17"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
+# Email autoconfiguration (derive IMAP/SMTP host:port from the user's domain when the
+# `X-Mailbox-*` host headers are absent). The resolver fetches Mozilla-style autoconfig
+# XML over HTTPS and falls back to RFC 6186 DNS SRV / MX lookups.
+#
+# reqwest is the async HTTP client for the autoconfig fetch. `default-features = false`
+# with the `*-no-provider` rustls feature keeps the crypto provider on the already-pinned
+# `ring` (see the rustls block above) instead of pulling aws-lc-rs and a C toolchain; the
+# process installs ring as the rustls default provider at startup. webpki-roots supplies
+# the trust anchors, matching the lettre/async-imap TLS stack. A custom `dns_resolver`
+# (see src/autoconfig.rs) rejects private/loopback targets to blunt SSRF, since the fetched
+# domain is caller-influenced.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots-no-provider",
+    "charset",
+    "http2",
+] }
+# quick-xml deserializes the autoconfig `clientConfig` document (incoming/outgoing server
+# host/port/socketType) via serde. Pure-Rust, no C deps.
+quick-xml = { version = "0.36", features = ["serialize"] }
+# hickory-resolver performs the RFC 6186 DNS SRV (`_imaps._tcp` / `_submission._tcp`) and
+# MX fallback lookups. `default-features = false` keeps it on plain UDP/TCP DNS (no
+# DNS-over-TLS/HTTPS providers to avoid re-introducing a second TLS backend).
+hickory-resolver = { version = "0.24", default-features = false, features = [
+    "tokio-runtime",
+    "system-config",
+] }
+
 # Support: header decoding, JSON error bodies, structured logging.
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }

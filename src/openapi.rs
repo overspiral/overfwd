@@ -14,10 +14,12 @@
 //! - **Axis 1 — gateway access:** `Authorization: Bearer <api_key>` (HTTP bearer,
 //!   scheme `gateway_api_key`). Enforced only when the gateway is configured with
 //!   `require_api_key`.
-//! - **Axis 2 — Inline mailbox credential:** three request headers carried as
-//!   `apiKey` schemes — `X-Mailbox-Auth: Basic base64(user:pass)` (`mailbox_auth`),
-//!   `X-Mailbox-Imap: host:port` (`mailbox_imap`), and `X-Mailbox-Smtp: host:port`
-//!   (`mailbox_smtp`).
+//! - **Axis 2 — Inline mailbox credential:** request headers carried as `apiKey`
+//!   schemes — `X-Mailbox-Auth: Basic base64(user:pass)` (`mailbox_auth`, required),
+//!   `X-Mailbox-Imap: host:port` (`mailbox_imap`) and `X-Mailbox-Smtp: host:port`
+//!   (`mailbox_smtp`). The two host headers are **optional**: when absent, `host:port`
+//!   is derived from the user's domain via autoconfiguration, optionally steered by
+//!   `X-Mailbox-Domain` (`mailbox_domain`) — see SPEC §5.
 //!
 //! ## Serving
 //!
@@ -44,7 +46,8 @@ use utoipa_swagger_ui::SwaggerUi;
             Two independent auth axes apply to every `/email` action: an \
             `Authorization: Bearer <api_key>` gateway key (Axis 1) and the Inline \
             mailbox credential carried in `X-Mailbox-Auth` / `X-Mailbox-Imap` / \
-            `X-Mailbox-Smtp` (Axis 2).",
+            `X-Mailbox-Smtp` (Axis 2). The host headers are optional — when absent \
+            the IMAP/SMTP target is autoconfigured from the user's domain (SPEC §5).",
         version = env!("CARGO_PKG_VERSION"),
         license(name = "MIT"),
     ),
@@ -110,7 +113,8 @@ impl Modify for SecurityAddon {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-Mailbox-Imap",
                 "Axis-2 IMAP target for reads (`search`/`get`): a bare `host:port` \
-                 (no scheme; TLS is inferred from the port).",
+                 (no scheme; TLS is inferred from the port). Optional — when absent, \
+                 the target is autoconfigured from the user's domain (SPEC §5).",
             ))),
         );
         components.add_security_scheme(
@@ -118,7 +122,17 @@ impl Modify for SecurityAddon {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-Mailbox-Smtp",
                 "Axis-2 SMTP target for writes (`send`): a bare `host:port` (no \
-                 scheme; TLS is inferred from the port).",
+                 scheme; TLS is inferred from the port). Optional — when absent, the \
+                 target is autoconfigured from the user's domain (SPEC §5).",
+            ))),
+        );
+        components.add_security_scheme(
+            "mailbox_domain",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                "X-Mailbox-Domain",
+                "Optional domain to autoconfigure the IMAP/SMTP target from when the \
+                 host headers are absent. Overrides the domain otherwise taken from \
+                 the mailbox username's `@` (SPEC §5).",
             ))),
         );
     }
