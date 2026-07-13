@@ -1,45 +1,47 @@
-//! Binary entrypoint: load `.env`, init tracing, read config, and serve with graceful shutdown.
+//! overfwd binary entrypoint (SPEC §4 Gateway).
+//!
+//! Loads [`overfwd::Config`] from the environment, builds the app router, and
+//! serves it. Everything of substance lives in the library crate so it can be
+//! unit- and integration-tested.
 
-use anyhow::Context;
-use overfwd::{Config, create_app};
-use tracing_subscriber::EnvFilter;
+use std::process::ExitCode;
+
+use overfwd::Config;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Load `.env` if present; real env vars still win over file values.
-    dotenvy::dotenv().ok();
-    init_tracing();
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "overfwd=info,tower_http=info".into()),
+        )
+        .init();
 
-    let config = Config::from_env().context("failed to load configuration")?;
-    let addr = format!("{}:{}", config.host, config.port);
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::error!(%err, "invalid configuration");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let app = create_app(config);
+    let bind = config.bind;
+    // Debug on Config redacts the api_key (see config.rs), so this is safe to log.
+    tracing::info!(?config, "starting overfwd");
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("failed to bind {addr}"))?;
-    tracing::info!("Listening on {addr}");
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::error!(%err, %bind, "failed to bind");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
-
-    tracing::info!("Shutdown complete");
-    Ok(())
-}
-
-/// Initialize the tracing subscriber. Honors `RUST_LOG`, defaulting to `info`.
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-/// Resolve once Ctrl-C is received, triggering axum's graceful shutdown.
-async fn shutdown_signal() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        tracing::error!(error = %err, "failed to listen for shutdown signal");
-        return;
+    tracing::info!(%bind, "overfwd listening");
+    if let Err(err) = axum::serve(listener, overfwd::app(config)).await {
+        tracing::error!(%err, "server error");
+        return ExitCode::FAILURE;
     }
-    tracing::info!("Received Ctrl-C, shutting down");
+
+    ExitCode::SUCCESS
 }

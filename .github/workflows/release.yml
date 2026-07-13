@@ -1,0 +1,117 @@
+name: Release
+
+# Triggered by the tag push that release-please creates when the
+# "chore(release): vX.Y.Z" PR merges. Builds the `overfwd` binary for Linux
+# (amd64 + arm64) and attaches the archives + SHA256SUMS.txt to the GitHub
+# release that release-please already created for the tag.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string — must end in -test (e.g. v0.1.0-test)'
+        required: true
+        default: 'v0.0.0-test'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enforce -test suffix on dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ "${{ inputs.version }}" != *-test ]]; then
+            echo "::error::Dispatch version must end in -test (got: ${{ inputs.version }})"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      # Native build on each runner's own arch — no cross-compilation, so no
+      # `--target` and no `rustup target add` needed.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Strip binary
+        run: strip target/release/overfwd
+
+      - name: Package
+        run: >-
+          tar czf
+          "overfwd-${VERSION}-${{ matrix.target }}.tar.gz"
+          -C target/release overfwd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: overfwd-${{ env.VERSION }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  checksums:
+    name: Checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        run: sha256sum overfwd-* | sort > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: SHA256SUMS.txt
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: [build, checksums]
+    # Dispatch runs validate the build but don't publish — download artifacts from the run instead.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          merge-multiple: true
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: dist/
+      # Attach binaries to the release release-please already created for this
+      # tag. `generate_release_notes` is intentionally omitted so the curated
+      # changelog notes release-please wrote are not overwritten.
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          fail_on_unmatched_files: true

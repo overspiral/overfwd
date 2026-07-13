@@ -1,105 +1,146 @@
-//! Configuration for the overfwd server, loaded from environment variables.
+//! Server configuration, read from the environment (SPEC §5 Axis 1, §10 Deployment).
 //!
-//! `.env` is loaded (via `dotenvy`) before `from_env` runs. The mail settings mirror
-//! the connection contract in `.env` so the future IMAP/SMTP bridge can consume them
-//! without any restructuring — v0 only reads them into the `Config`.
+//! Two knobs matter for the spine:
+//! - **bind address/port** — MUST be configurable and MUST NOT default to `8080`
+//!   (that port is GreenMail's management API in this repo's e2e stack).
+//! - **`require_api_key`** — the Axis-1 gateway-access toggle: on for hosted/Cloud,
+//!   optional for self-host.
 
-use std::env;
+use std::net::SocketAddr;
 
-/// Top-level server configuration.
-#[derive(Debug, Clone)]
+use crate::auth::Secret;
+
+/// Default listen address. Port `8000` is chosen deliberately to avoid `8080`,
+/// which the shared GreenMail e2e stack uses for its management REST API.
+const DEFAULT_BIND: &str = "0.0.0.0:8000";
+
+/// Environment variable names, kept together so they are easy to audit.
+const ENV_BIND: &str = "OVERFWD_BIND";
+const ENV_REQUIRE_API_KEY: &str = "OVERFWD_REQUIRE_API_KEY";
+const ENV_API_KEY: &str = "OVERFWD_API_KEY";
+
+/// Immutable, process-wide server configuration (SPEC §5, §10).
+#[derive(Clone)]
 pub struct Config {
-    /// Address to bind the HTTP listener to.
-    pub host: String,
-    /// Port to bind the HTTP listener to.
-    pub port: u16,
-    /// Upstream mail server connection details (unused in v0, ready for the bridge).
-    pub mail: MailConfig,
-    /// GreenMail management REST API base URL.
-    pub greenmail_api: String,
+    /// Socket the HTTP server binds to.
+    pub bind: SocketAddr,
+    /// Axis-1 gateway-access toggle. When `false`, the bearer check is skipped
+    /// (valid self-host posture, SPEC §10).
+    pub require_api_key: bool,
+    /// The single static gateway api_key (SPEC §5 Axis 1). Present iff
+    /// `require_api_key` is `true`; wrapped in [`Secret`] so it never logs.
+    pub api_key: Option<Secret>,
 }
 
-/// SMTP/IMAP connection contract, sourced from the `MAIL_*` env vars.
-#[derive(Debug, Clone)]
-pub struct MailConfig {
-    pub smtp_host: String,
-    pub smtp_port: u16,
-    pub smtp_tls_port: u16,
-    pub imap_host: String,
-    pub imap_port: u16,
-    pub imap_tls_port: u16,
-    /// Login id (short form) used for SMTP AUTH / IMAP LOGIN — not the email address.
-    pub user: String,
-    pub pass: String,
-    /// The actual email address for envelope From/To.
-    pub address: String,
-    /// GreenMail's TLS ports use a self-signed cert; clients must skip verification.
-    pub tls_insecure: bool,
-}
-
-/// Errors that can occur while loading configuration.
+/// Errors from loading [`Config`] out of the environment.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("invalid value for {var}: {source}")]
-    InvalidPort {
-        var: &'static str,
-        #[source]
-        source: std::num::ParseIntError,
+    #[error("{ENV_BIND}='{value}' is not a valid host:port address: {source}")]
+    InvalidBind {
+        value: String,
+        source: std::net::AddrParseError,
     },
-    #[error("invalid value for {var}: expected `true` or `false`, got `{value}`")]
-    InvalidBool { var: &'static str, value: String },
+    #[error("{ENV_REQUIRE_API_KEY}='{value}' is not a valid boolean (use true/false)")]
+    InvalidBool { value: String },
+    #[error(
+        "{ENV_REQUIRE_API_KEY}=true but {ENV_API_KEY} is unset — refusing to start a gateway \
+         that requires a key it does not have"
+    )]
+    MissingApiKey,
 }
 
 impl Config {
-    /// Build a `Config` from the process environment, applying defaults for anything unset.
+    /// Load configuration from the process environment, applying defaults.
+    ///
+    /// Fails fast (rather than at first request) when the config is internally
+    /// inconsistent — e.g. `require_api_key=true` with no key configured.
     pub fn from_env() -> Result<Self, ConfigError> {
+        let bind_raw = env_or(ENV_BIND, DEFAULT_BIND);
+        let bind = bind_raw
+            .parse::<SocketAddr>()
+            .map_err(|source| ConfigError::InvalidBind {
+                value: bind_raw.clone(),
+                source,
+            })?;
+
+        let require_api_key = match std::env::var(ENV_REQUIRE_API_KEY) {
+            Ok(v) => parse_bool(&v).ok_or(ConfigError::InvalidBool { value: v })?,
+            Err(_) => false,
+        };
+
+        let api_key = std::env::var(ENV_API_KEY)
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(Secret::new);
+
+        if require_api_key && api_key.is_none() {
+            return Err(ConfigError::MissingApiKey);
+        }
+
         Ok(Self {
-            host: env::var("OVERFWD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
-            // Default 3000 avoids GreenMail's management API on 8080.
-            port: parse_port("OVERFWD_PORT", 3000)?,
-            mail: MailConfig::from_env()?,
-            greenmail_api: env::var("GREENMAIL_API")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
+            bind,
+            require_api_key,
+            api_key,
         })
     }
 }
 
-impl MailConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        Ok(Self {
-            smtp_host: env::var("MAIL_SMTP_HOST").unwrap_or_else(|_| "localhost".to_string()),
-            smtp_port: parse_port("MAIL_SMTP_PORT", 3025)?,
-            smtp_tls_port: parse_port("MAIL_SMTP_TLS_PORT", 3465)?,
-            imap_host: env::var("MAIL_IMAP_HOST").unwrap_or_else(|_| "localhost".to_string()),
-            imap_port: parse_port("MAIL_IMAP_PORT", 3143)?,
-            imap_tls_port: parse_port("MAIL_IMAP_TLS_PORT", 3993)?,
-            user: env::var("MAIL_USER").unwrap_or_else(|_| "test".to_string()),
-            pass: env::var("MAIL_PASS").unwrap_or_else(|_| "test".to_string()),
-            address: env::var("MAIL_ADDRESS").unwrap_or_else(|_| "test@localhost".to_string()),
-            tls_insecure: parse_bool("MAIL_TLS_INSECURE", true)?,
-        })
+/// Redacts the api_key so a `{:?}` of `Config` (e.g. in a startup log) can't leak it.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("bind", &self.bind)
+            .field("require_api_key", &self.require_api_key)
+            .field("api_key", &self.api_key)
+            .finish()
     }
 }
 
-/// Parse a port env var, falling back to `default` when unset/empty.
-fn parse_port(var: &'static str, default: u16) -> Result<u16, ConfigError> {
-    match env::var(var) {
-        Ok(v) if !v.trim().is_empty() => v
-            .trim()
-            .parse()
-            .map_err(|source| ConfigError::InvalidPort { var, source }),
-        _ => Ok(default),
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse a permissive boolean: `true/false`, `1/0`, `yes/no`, `on/off` (case-insensitive).
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
-/// Parse a boolean env var (`true`/`false`, case-insensitive), falling back to `default`.
-fn parse_bool(var: &'static str, default: bool) -> Result<bool, ConfigError> {
-    match env::var(var) {
-        Ok(v) if !v.trim().is_empty() => match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
-            _ => Err(ConfigError::InvalidBool { var, value: v }),
-        },
-        _ => Ok(default),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_accepts_common_spellings() {
+        for t in ["true", "TRUE", "1", "yes", "on", " On "] {
+            assert_eq!(parse_bool(t), Some(true), "{t}");
+        }
+        for f in ["false", "FALSE", "0", "no", "off"] {
+            assert_eq!(parse_bool(f), Some(false), "{f}");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn default_bind_is_not_the_greenmail_mgmt_port() {
+        let bind: SocketAddr = DEFAULT_BIND.parse().unwrap();
+        assert_ne!(bind.port(), 8080, "must not clash with GreenMail mgmt API");
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let cfg = Config {
+            bind: DEFAULT_BIND.parse().unwrap(),
+            require_api_key: true,
+            api_key: Some(Secret::new("super-secret-key".to_string())),
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("super-secret-key"),
+            "Debug leaked the api_key: {rendered}"
+        );
     }
 }

@@ -1,30 +1,100 @@
 [package]
 name = "overfwd"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-description = "REST -> IMAP/SMTP bridge (mail forwarding). v0 HTTP scaffold."
-
-[[bin]]
-name = "overfwd"
-path = "src/main.rs"
+edition = "2021"
+description = "A stateless REST facade over remote IMAP/SMTP mailboxes (Mailbox Gateway)."
+license = "MIT"
+repository = "https://github.com/overspiral/overfwd"
 
 [lib]
 name = "overfwd"
 path = "src/lib.rs"
 
+[[bin]]
+name = "overfwd"
+path = "src/main.rs"
+
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
+# HTTP server + async runtime (SPEC §4 Gateway).
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.7", features = ["trace"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.8"
+
+# Provider-facing mail stack (SPEC §4). Declared now so downstream IMAP/SMTP/action
+# tasks don't have to re-touch Cargo.toml; unused until those tasks land. rustls is
+# selected over native-tls to keep the build free of a system OpenSSL dependency.
+async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
+lettre = { version = "0.11", default-features = false, features = [
+    "tokio1",
+    "tokio1-rustls",
+    "ring",          # rustls crypto provider (avoids a system OpenSSL dependency)
+    "webpki-roots",  # trust anchors for rustls
+    "smtp-transport",
+    "builder",
+] }
+mail-parser = "0.11"
+mail-builder = "0.4"
+
+# TLS for the IMAP client (SPEC §4). async-imap is built `runtime-tokio` with no
+# bundled TLS, so the IMAP module supplies its own TLS stream. rustls+ring is
+# chosen to match the lettre/webpki-roots stack above and keep the build free of a
+# system OpenSSL dependency. `webpki-roots` provides trust anchors for the secure
+# path; the insecure path (GreenMail self-signed, MAIL_TLS_INSECURE) uses a custom
+# accept-all verifier. `default-features = false` keeps the crypto provider on ring
+# (not aws-lc-rs, which would pull a C toolchain).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "1"
+# Stream combinators for draining async-imap's FETCH result stream.
+futures-util = "0.3"
+# SHA-256 for the connection pool's opaque, credential-keyed handle (SPEC §4
+# pooling): the raw mailbox password is never used as a plaintext map key. `ring`
+# is already the pinned crypto provider (rustls+ring above), so declaring it
+# directly adds no new crate to the build.
+ring = "0.17"
+
+# Code-derived OpenAPI 3.1 (SPEC §6/§7). utoipa generates the spec from the real
+# request/response types via `ToSchema`/`#[utoipa::path]` derives, so the document
+# can't drift from the handlers. Pure Rust — no system OpenSSL, matching the
+# rustls/ring stance above. `axum_extras` teaches the path macro about axum
+# extractors; swagger-ui's `axum` feature yields a mountable `Router`.
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# Email autoconfiguration (derive IMAP/SMTP host:port from the user's domain when the
+# `X-Mailbox-*` host headers are absent). The resolver fetches Mozilla-style autoconfig
+# XML over HTTPS and falls back to RFC 6186 DNS SRV / MX lookups.
+#
+# reqwest is the async HTTP client for the autoconfig fetch. `default-features = false`
+# with the `*-no-provider` rustls feature keeps the crypto provider on the already-pinned
+# `ring` (see the rustls block above) instead of pulling aws-lc-rs and a C toolchain; the
+# process installs ring as the rustls default provider at startup. webpki-roots supplies
+# the trust anchors, matching the lettre/async-imap TLS stack. A custom `dns_resolver`
+# (see src/autoconfig.rs) rejects private/loopback targets to blunt SSRF, since the fetched
+# domain is caller-influenced.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots-no-provider",
+    "charset",
+    "http2",
+] }
+# quick-xml deserializes the autoconfig `clientConfig` document (incoming/outgoing server
+# host/port/socketType) via serde. Pure-Rust, no C deps.
+quick-xml = { version = "0.36", features = ["serialize"] }
+# hickory-resolver performs the RFC 6186 DNS SRV (`_imaps._tcp` / `_submission._tcp`) and
+# MX fallback lookups. `default-features = false` keeps it on plain UDP/TCP DNS (no
+# DNS-over-TLS/HTTPS providers to avoid re-introducing a second TLS backend).
+hickory-resolver = { version = "0.24", default-features = false, features = [
+    "tokio-runtime",
+    "system-config",
+] }
+
+# Support: header decoding, JSON error bodies, structured logging.
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-anyhow = "1"
-dotenvy = "0.15"
 
 [dev-dependencies]
-reqwest = { version = "0.13", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
