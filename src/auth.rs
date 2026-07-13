@@ -313,8 +313,8 @@ fn parse_basic(value: &str) -> Result<(String, Secret), GatewayError> {
         .map_err(|_| malformed())?;
     let decoded = String::from_utf8(decoded).map_err(|_| malformed())?;
 
-    // Strip a trailing newline from the decoded credential. It is never part of a
-    // real credential (a newline can't be typed into a password field or an HTTP
+    // Strip trailing newline(s) from the decoded credential. They are never part of
+    // a real credential (a newline can't be typed into a password field or an HTTP
     // header, and IMAP/SMTP auth rejects control chars) — its only source is
     // `base64 <file>` including the file's trailing `\n`. Only `\r`/`\n` are
     // trimmed, deliberately not spaces/tabs, which could be genuine password bytes.
