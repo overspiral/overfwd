@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::auth::{require_gateway_access, InlineHeaders};
+use crate::auth::{require_gateway_access, InlineHeaders, MailboxCredential};
 use crate::error::{ErrorResponse, GatewayError};
 use crate::imap::{self, FullMessage, ImapSettings, MessageSummary};
 use crate::send::{SendDisclosure, SendRequest, SendResponse};
@@ -50,8 +50,21 @@ pub fn router(state: AppState) -> Router {
             require_gateway_access,
         ));
 
-    Router::new()
-        .nest("/email", email)
+    let mut router = Router::new().nest("/email", email);
+
+    // The MCP endpoint exposes the same three actions as JSON-RPC 2.0 tools, behind the
+    // same Axis-1 gate as `/email` (SPEC §5). Off when `OVERFWD_ENABLE_MCP=false`.
+    if state.config.enable_mcp {
+        let mcp = Router::new()
+            .route("/mcp", post(crate::mcp::mcp_endpoint))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_gateway_access,
+            ));
+        router = router.merge(mcp);
+    }
+
+    router
         .with_state(state)
         .merge(crate::openapi::openapi_router())
 }
@@ -116,9 +129,19 @@ pub(crate) async fn search(
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
+    Ok(Json(do_search(&credential, request).await?))
+}
+
+/// The `search` action's business core, shared by the REST handler and the MCP tool
+/// (`crate::mcp`). Takes an already-resolved [`MailboxCredential`] so the caller owns
+/// credential resolution (done once per HTTP request).
+pub(crate) async fn do_search(
+    credential: &MailboxCredential,
+    request: SearchRequest,
+) -> Result<Vec<MessageSummary>, GatewayError> {
     let settings = ImapSettings::from_env();
     let folder = request.folder.as_deref().unwrap_or(imap::DEFAULT_MAILBOX);
-    let mut summaries = imap::search(&credential, &settings, folder, &request.query).await?;
+    let mut summaries = imap::search(credential, &settings, folder, &request.query).await?;
 
     // The IMAP layer returns ascending UID (newest-last) and leaves ordering to us
     // (SPEC §4). Present newest-first, then clamp — so `limit` keeps the newest N.
@@ -127,7 +150,7 @@ pub(crate) async fn search(
         summaries.truncate(limit);
     }
 
-    Ok(Json(summaries))
+    Ok(summaries)
 }
 
 /// Request schema for `POST /email/get` (SPEC §6). `uid` is required.
@@ -177,11 +200,17 @@ pub(crate) async fn get(
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
+    Ok(Json(do_get(&credential, request).await?))
+}
+
+/// The `get` action's business core, shared by the REST handler and the MCP tool.
+pub(crate) async fn do_get(
+    credential: &MailboxCredential,
+    request: GetRequest,
+) -> Result<FullMessage, GatewayError> {
     let settings = ImapSettings::from_env();
     let folder = request.folder.as_deref().unwrap_or(imap::DEFAULT_MAILBOX);
-    let message = imap::get(&credential, &settings, folder, request.uid).await?;
-
-    Ok(Json(message))
+    imap::get(credential, &settings, folder, request.uid).await
 }
 
 /// `POST /email/send` — build a message and submit it over SMTP (write; SPEC §4/§6).
@@ -225,6 +254,19 @@ pub(crate) async fn send(
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
+    Ok(Json(do_send(&credential, request).await?))
+}
+
+/// The `send` action's business core, shared by the REST handler and the MCP tool.
+///
+/// Keeps the audit `tracing::info!` line (SPEC §6: To/From/Subject only) so both the
+/// REST route and the MCP tool log identically. The `X-Mailbox-Auth` Basic header and
+/// the mailbox password never reach a log line — the password is a `Secret` and only
+/// the non-secret disclosure fields are logged.
+pub(crate) async fn do_send(
+    credential: &MailboxCredential,
+    request: SendRequest,
+) -> Result<SendResponse, GatewayError> {
     let message = request.into_message()?;
     let disclosure = SendDisclosure::for_message(&message);
 
@@ -238,9 +280,6 @@ pub(crate) async fn send(
     )
     .await?;
 
-    // Audit (SPEC §6): To/From/Subject only. The `X-Mailbox-Auth` Basic header and
-    // the mailbox password never reach a log line — the password is a `Secret` and
-    // we log only the non-secret disclosure fields.
     tracing::info!(
         from = %disclosure.from,
         to = ?disclosure.to,
@@ -248,5 +287,5 @@ pub(crate) async fn send(
         "send accepted by provider",
     );
 
-    Ok(Json(SendResponse::accepted(disclosure)))
+    Ok(SendResponse::accepted(disclosure))
 }

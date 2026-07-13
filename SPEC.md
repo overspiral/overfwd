@@ -183,6 +183,22 @@ owner granted read permission at all* — not a per-fetch approval.
 **`send` disclosure** (for callers that surface approvals): the request discloses To / From /
 Subject plus a clamped Body; the `Basic` auth header is **redacted** from any disclosure/audit.
 
+### MCP surface
+
+The same three actions are also exposed as **Model Context Protocol tools** at `POST /mcp`
+(JSON-RPC 2.0, MCP Streamable HTTP in stateless JSON mode), so an agent can consume the gateway
+as an MCP server. This is a *consumption surface* over the existing actions, not agent
+orchestration (§2 Non-Goals). Tools: `email_search`, `email_get`, `email_send`; their input
+schemas are the same code-derived JSON Schemas as the REST request bodies, so they cannot drift.
+
+Both auth axes (§5) are unchanged and travel as HTTP headers on every POST: the gateway key as
+`Authorization: Bearer` (Axis 1, same gate as `/email`), the mailbox credential as `X-Mailbox-*`
+(Axis 2, read per `tools/call`). The server is stateless — no `Mcp-Session-Id`, nothing kept
+between requests. Provider failures surface as a tool result with `isError: true` carrying the
+stable `{ code, message }` envelope (§7); malformed calls / missing credentials surface as
+JSON-RPC errors. The endpoint is on by default and disabled with `OVERFWD_ENABLE_MCP=false`
+(§10). It advertises only the `tools` capability (a strict subset of MCP; no resources/prompts).
+
 ### Later additions (not v1)
 
 - `get_attachment` — binary payloads, with a `prefer_stream` option for large attachments.

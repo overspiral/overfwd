@@ -313,6 +313,13 @@ fn parse_basic(value: &str) -> Result<(String, Secret), GatewayError> {
         .map_err(|_| malformed())?;
     let decoded = String::from_utf8(decoded).map_err(|_| malformed())?;
 
+    // Strip trailing newline(s) from the decoded credential. They are never part of
+    // a real credential (a newline can't be typed into a password field or an HTTP
+    // header, and IMAP/SMTP auth rejects control chars) — its only source is
+    // `base64 <file>` including the file's trailing `\n`. Only `\r`/`\n` are
+    // trimmed, deliberately not spaces/tabs, which could be genuine password bytes.
+    let decoded = decoded.trim_end_matches(['\r', '\n']);
+
     let (user, pass) = decoded.split_once(':').ok_or_else(malformed)?;
     if user.is_empty() {
         return Err(malformed());
@@ -387,6 +394,35 @@ mod tests {
         let (user, pass) = parse_basic(&basic("test", "a:b:c")).unwrap();
         assert_eq!(user, "test");
         assert_eq!(pass.expose(), "a:b:c");
+    }
+
+    #[test]
+    fn parse_basic_strips_trailing_newline_from_credential() {
+        // `base64 <file>` includes the file's trailing newline; it must not leak
+        // into the password. Covers bare LF and CRLF.
+        for (encoded, why) in [("test:s3cr3t\n", "LF"), ("test:s3cr3t\r\n", "CRLF")] {
+            let header = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(encoded)
+            );
+            let (user, pass) = parse_basic(&header).unwrap();
+            assert_eq!(user, "test", "{why}");
+            assert_eq!(
+                pass.expose(),
+                "s3cr3t",
+                "{why}: trailing newline not stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_basic_keeps_trailing_space_and_interior_newline() {
+        // A trailing space could be a genuine password byte — do not trim it. An
+        // interior newline is preserved; only a trailing one is an encoding artifact.
+        let (_, pass) = parse_basic(&basic("test", "s3cr3t ")).unwrap();
+        assert_eq!(pass.expose(), "s3cr3t ");
+        let (_, pass) = parse_basic(&basic("test", "a\nb")).unwrap();
+        assert_eq!(pass.expose(), "a\nb");
     }
 
     #[test]

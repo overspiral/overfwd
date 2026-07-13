@@ -18,6 +18,7 @@ const DEFAULT_BIND: &str = "0.0.0.0:8000";
 const ENV_BIND: &str = "OVERFWD_BIND";
 const ENV_REQUIRE_API_KEY: &str = "OVERFWD_REQUIRE_API_KEY";
 const ENV_API_KEY: &str = "OVERFWD_API_KEY";
+const ENV_ENABLE_MCP: &str = "OVERFWD_ENABLE_MCP";
 
 /// Immutable, process-wide server configuration (SPEC §5, §10).
 #[derive(Clone)]
@@ -30,6 +31,11 @@ pub struct Config {
     /// The single static gateway api_key (SPEC §5 Axis 1). Present iff
     /// `require_api_key` is `true`; wrapped in [`Secret`] so it never logs.
     pub api_key: Option<Secret>,
+    /// Whether to serve the MCP endpoint at `POST /mcp` (SPEC §5). Defaults to `true`;
+    /// the endpoint sits behind the same Axis-1 gateway-access gate as `/email`, so
+    /// enabling it adds no unauthenticated surface. Set `OVERFWD_ENABLE_MCP=false` to
+    /// run a pure-REST deployment.
+    pub enable_mcp: bool,
 }
 
 /// Errors from loading [`Config`] out of the environment.
@@ -40,8 +46,8 @@ pub enum ConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
-    #[error("{ENV_REQUIRE_API_KEY}='{value}' is not a valid boolean (use true/false)")]
-    InvalidBool { value: String },
+    #[error("{var}='{value}' is not a valid boolean (use true/false)")]
+    InvalidBool { var: &'static str, value: String },
     #[error(
         "{ENV_REQUIRE_API_KEY}=true but {ENV_API_KEY} is unset — refusing to start a gateway \
          that requires a key it does not have"
@@ -64,7 +70,10 @@ impl Config {
             })?;
 
         let require_api_key = match std::env::var(ENV_REQUIRE_API_KEY) {
-            Ok(v) => parse_bool(&v).ok_or(ConfigError::InvalidBool { value: v })?,
+            Ok(v) => parse_bool(&v).ok_or(ConfigError::InvalidBool {
+                var: ENV_REQUIRE_API_KEY,
+                value: v,
+            })?,
             Err(_) => false,
         };
 
@@ -77,10 +86,19 @@ impl Config {
             return Err(ConfigError::MissingApiKey);
         }
 
+        let enable_mcp = match std::env::var(ENV_ENABLE_MCP) {
+            Ok(v) => parse_bool(&v).ok_or(ConfigError::InvalidBool {
+                var: ENV_ENABLE_MCP,
+                value: v,
+            })?,
+            Err(_) => true,
+        };
+
         Ok(Self {
             bind,
             require_api_key,
             api_key,
+            enable_mcp,
         })
     }
 }
@@ -92,6 +110,7 @@ impl std::fmt::Debug for Config {
             .field("bind", &self.bind)
             .field("require_api_key", &self.require_api_key)
             .field("api_key", &self.api_key)
+            .field("enable_mcp", &self.enable_mcp)
             .finish()
     }
 }
@@ -136,6 +155,7 @@ mod tests {
             bind: DEFAULT_BIND.parse().unwrap(),
             require_api_key: true,
             api_key: Some(Secret::new("super-secret-key".to_string())),
+            enable_mcp: true,
         };
         let rendered = format!("{cfg:?}");
         assert!(

@@ -66,6 +66,7 @@ fn stub_app() -> Router {
             bind: "0.0.0.0:8000".parse().unwrap(),
             require_api_key: false,
             api_key: None,
+            enable_mcp: true,
         }),
         autoconfig: Arc::new(autoconfig),
     };
