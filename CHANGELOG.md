@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/overspiral/overfwd/compare/v0.1.0...v0.2.0) (2026-07-13)
+
+
+### Features
+
+* **autoconfig:** resolve via MX provider's own autoconfig, not just ISPDB ([#19](https://github.com/overspiral/overfwd/issues/19)) ([0de5da5](https://github.com/overspiral/overfwd/commit/0de5da5a9ba9c4ff310bde7f3744d637727d3db2))
+
+
+### Bug Fixes
+
+* **auth:** strip trailing newline from decoded X-Mailbox-Auth credential ([#20](https://github.com/overspiral/overfwd/issues/20)) ([f0af0d6](https://github.com/overspiral/overfwd/commit/f0af0d6186233034c72615e4b652b5c5c436fca8))
+
 ## 0.1.0 (2026-07-13)
 
 Initial release of **overfwd** — a stateless REST facade over remote IMAP/SMTP
