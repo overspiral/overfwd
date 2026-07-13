@@ -407,7 +407,11 @@ mod tests {
             );
             let (user, pass) = parse_basic(&header).unwrap();
             assert_eq!(user, "test", "{why}");
-            assert_eq!(pass.expose(), "s3cr3t", "{why}: trailing newline not stripped");
+            assert_eq!(
+                pass.expose(),
+                "s3cr3t",
+                "{why}: trailing newline not stripped"
+            );
         }
     }
 
