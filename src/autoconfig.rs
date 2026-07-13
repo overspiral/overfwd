@@ -9,7 +9,10 @@
 //! 2. Well-known `https://<domain>/.well-known/autoconfig/mail/config-v1.1.xml`.
 //! 3. The Thunderbird ISPDB `https://autoconfig.thunderbird.net/v1.1/<domain>`.
 //! 4. RFC 6186 DNS SRV (`_imaps._tcp` / `_submissions._tcp` / …).
-//! 5. MX → map the exchanger's registrable domain back onto the ISPDB (step 3).
+//! 5. MX → the exchanger's registrable domain, then re-run the HTTP ladder
+//!    (steps 1–3) against that provider. So a provider that publishes autoconfig
+//!    but is absent from the ISPDB (e.g. Migadu, at `autoconfig.migadu.com`) is
+//!    still resolved for a custom domain whose MX points at it.
 //!
 //! Only the SPEC §8 "standard-IMAP long tail" is in scope; Gmail/Outlook are not.
 //!
@@ -247,8 +250,28 @@ impl Autoconfig {
     async fn run_ladder(&self, domain: &str, email: Option<&str>) -> MailServers {
         let mut acc = MailServers::default();
 
-        // Rungs 1–3: Mozilla autoconfig XML over HTTPS.
-        for url in http_config_urls(domain, email) {
+        // Rungs 1–3: Mozilla autoconfig XML over HTTPS for the domain itself.
+        acc.merge_from(self.http_ladder(http_config_urls(domain, email)).await);
+
+        // Rung 4: RFC 6186 DNS SRV. Prefer implicit-TLS records (`_imaps` / `_submissions`).
+        if !acc.is_complete() {
+            acc.merge_from(self.srv_lookup(domain).await);
+        }
+
+        // Rung 5: MX → the exchanger's registrable domain, then re-run the HTTP ladder
+        // against that provider (provider-hosted + well-known + ISPDB).
+        if !acc.is_complete() {
+            acc.merge_from(self.mx_autoconfig(domain).await);
+        }
+
+        acc
+    }
+
+    /// Walk a list of HTTP autoconfig URLs in order, merging each parsed result until
+    /// both sides are known. Per-URL fetch errors are logged and skipped.
+    async fn http_ladder(&self, urls: Vec<String>) -> MailServers {
+        let mut acc = MailServers::default();
+        for url in urls {
             if acc.is_complete() {
                 break;
             }
@@ -262,19 +285,6 @@ impl Autoconfig {
                 Err(err) => tracing::debug!(%url, %err, "autoconfig fetch failed; trying next"),
             }
         }
-
-        // Rung 4: RFC 6186 DNS SRV. Prefer implicit-TLS records (`_imaps` / `_submissions`).
-        if !acc.is_complete() {
-            acc.merge_from(self.srv_lookup(domain).await);
-        }
-
-        // Rung 5: MX → registrable domain → ISPDB.
-        if !acc.is_complete() {
-            if let Some(found) = self.mx_to_ispdb(domain).await {
-                acc.merge_from(found);
-            }
-        }
-
         acc
     }
 
@@ -310,17 +320,23 @@ impl Autoconfig {
         MailServers { imap, smtp }
     }
 
-    async fn mx_to_ispdb(&self, domain: &str) -> Option<MailServers> {
-        let exchanger = first(self.dns.mx(domain).await)?;
+    /// Resolve via the MX exchanger's provider: take the exchanger's registrable
+    /// domain and run the HTTP autoconfig ladder against it. This covers the common
+    /// custom-domain case where MX points at a hosting provider (Migadu, Fastmail,
+    /// …) that publishes its own autoconfig even when the ISPDB has no entry for it.
+    ///
+    /// The mailbox address lives at `domain`, not `mx_domain`, so it is *not*
+    /// forwarded to the provider's `?emailaddress=` query — the bare provider ladder
+    /// is what we want and it avoids leaking the address to a third-party endpoint.
+    async fn mx_autoconfig(&self, domain: &str) -> MailServers {
+        let Some(exchanger) = first(self.dns.mx(domain).await) else {
+            return MailServers::default();
+        };
         let mx_domain = registrable_domain(&exchanger);
         if mx_domain == domain || !is_public_domain(&mx_domain) {
-            return None;
+            return MailServers::default();
         }
-        let url = format!("{ISPDB_BASE}/{mx_domain}");
-        match self.http.get(&url).await {
-            Ok(Some(body)) => parse_autoconfig(&body),
-            _ => None,
-        }
+        self.http_ladder(http_config_urls(&mx_domain, None)).await
     }
 
     fn cache_get(&self, domain: &str) -> Option<Option<MailServers>> {
@@ -721,6 +737,30 @@ mod tests {
         let ac = ac(FakeHttp::with(&ispdb, FASTMAIL_XML), dns);
         let servers = ac.resolve("customdomain.test", None).await.unwrap();
         assert_eq!(servers.imap.unwrap().host, "imap.fastmail.com");
+    }
+
+    /// Regression for the Migadu case: a custom domain whose MX points at a provider
+    /// that publishes provider-hosted autoconfig but is **absent from the ISPDB**.
+    /// Rung 5 must run the whole HTTP ladder against the MX registrable domain, not
+    /// just the ISPDB, or resolution fails.
+    #[tokio::test]
+    async fn falls_back_to_mx_provider_hosted_autoconfig() {
+        let migadu_xml = FASTMAIL_XML.replace("fastmail.com", "migadu.com");
+        let mut dns = FakeSrv::default();
+        dns.mx.insert(
+            "overslash.com".to_string(),
+            vec![
+                "aspmx1.migadu.com".to_string(),
+                "aspmx2.migadu.com".to_string(),
+            ],
+        );
+        // Only the provider-hosted URL answers; the ISPDB rung for migadu.com 404s
+        // (it is simply absent from FakeHttp), mirroring production.
+        let provider = "https://autoconfig.migadu.com/mail/config-v1.1.xml";
+        let ac = ac(FakeHttp::with(provider, &migadu_xml), dns);
+        let servers = ac.resolve("overslash.com", None).await.unwrap();
+        assert_eq!(servers.imap.unwrap().host, "imap.migadu.com");
+        assert_eq!(servers.smtp.unwrap().port, 465);
     }
 
     #[tokio::test]
