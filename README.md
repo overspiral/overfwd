@@ -16,6 +16,32 @@ cargo run                 # reads config from the environment; listens on OVERFW
 cargo build --release     # optimized binary at target/release/overfwd
 ```
 
+## Run with Docker
+
+Multi-arch images (amd64 + arm64) are published to Docker Hub on every release:
+
+```bash
+docker run -p 8000:8000 angelmanuel/overfwd:latest
+```
+
+Configuration is entirely environment-driven — no config files. The common knobs:
+
+| Variable                 | Default        | Purpose                                            |
+|--------------------------|----------------|----------------------------------------------------|
+| `OVERFWD_BIND`           | `0.0.0.0:8000` | Listen socket.                                     |
+| `OVERFWD_REQUIRE_API_KEY`| `false`        | Require an `Authorization: Bearer` gateway key.    |
+| `OVERFWD_API_KEY`        | —              | The gateway key (required when the above is true). |
+
+```bash
+docker run -p 8000:8000 \
+  -e OVERFWD_REQUIRE_API_KEY=true \
+  -e OVERFWD_API_KEY=your-secret-key \
+  angelmanuel/overfwd:latest
+```
+
+The image runs as a non-root user on a minimal distroless base (no shell); the
+unauthenticated `GET /openapi.json` route can serve as a liveness probe.
+
 ## Endpoints
 
 | Method | Path            | Class | Behaviour            |
