@@ -26,6 +26,10 @@
 //! [`openapi_router`] exposes `GET /openapi.json` (the raw spec) and `GET /docs`
 //! (interactive Swagger UI). Both live **outside** the Axis-1 gate so the docs are
 //! reachable without a gateway key.
+//!
+//! The MCP endpoint at `POST /mcp` (see [`crate::mcp`]) is JSON-RPC 2.0, not REST, and
+//! is deliberately **not** part of this OpenAPI document; it reuses the same request
+//! schemas (`SearchRequest`/`GetRequest`/`SendRequest`) to derive its tool inputs.
 
 use axum::routing::get;
 use axum::{Json, Router};
