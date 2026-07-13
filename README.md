@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/logo.png" alt="overfwd logo" width="220">
+</p>
+
 # overfwd
 
 A stateless REST facade over remote IMAP/SMTP mailboxes — a single small Rust
