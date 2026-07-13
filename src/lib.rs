@@ -20,6 +20,7 @@
 //! | [`send::SendRequest`]          | §6             | The `POST /email/send` JSON schema, its validation into an `OutgoingMessage`, and the redaction-safe To/From/Subject disclosure. |
 //! | [`pool::ImapPool`]             | §4             | Ephemeral in-memory, per-credential, bounded/LRU/TTL'd cache of warm IMAP sessions; per-request login is the fallback. |
 //! | [`routes::router`]             | §6             | `POST /email/{search,get,send}` — all live: `search`/`get` over IMAP, `send` over SMTP. |
+//! | [`mcp::mcp_endpoint`]          | §5, §6         | The same three actions as JSON-RPC 2.0 MCP tools at `POST /mcp`, behind the Axis-1 gate. |
 //! | [`openapi::ApiDoc`]            | §6, §7         | Code-derived OpenAPI 3.1 document, served at `/openapi.json` + Swagger UI at `/docs` (both outside the Axis-1 gate). |
 //!
 //! Out of scope here (SPEC §5, §11): Portfolio/Session credential sources,
@@ -30,6 +31,7 @@ pub mod autoconfig;
 pub mod config;
 pub mod error;
 pub mod imap;
+pub mod mcp;
 pub mod openapi;
 pub mod pool;
 pub mod routes;

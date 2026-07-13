@@ -148,6 +148,7 @@ fn gateway_config() -> Config {
         bind: "0.0.0.0:8000".parse().unwrap(),
         require_api_key: false,
         api_key: None,
+        enable_mcp: true,
     }
 }
 

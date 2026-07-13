@@ -19,6 +19,7 @@ fn config(require_api_key: bool, api_key: Option<&str>) -> Config {
         bind: "0.0.0.0:8000".parse().unwrap(),
         require_api_key,
         api_key: api_key.map(|k| overfwd::auth::Secret::new(k.to_string())),
+        enable_mcp: true,
     }
 }
 
