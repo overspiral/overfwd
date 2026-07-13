@@ -1,0 +1,7 @@
+# The image is built from a pre-compiled binary staged into the context by the
+# release workflow. Exclude everything except the staged per-arch binaries so
+# the build context stays tiny and reproducible. (The Dockerfile is read
+# directly by the builder, not copied from the context, so ignoring it is fine.)
+*
+!overfwd-amd64
+!overfwd-arm64
