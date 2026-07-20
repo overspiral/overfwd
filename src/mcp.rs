@@ -275,13 +275,18 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "email_search",
-                "description": "Search a mailbox folder via IMAP using a raw IMAP SEARCH \
-                    key (e.g. \"ALL\", \"UNSEEN\", \"SUBJECT \\\"hi\\\"\"). Returns \
+                "description": "Search a mailbox folder via IMAP. Filter with the \
+                    structured params — `from`, `subject`, `text` (headers and body), \
+                    `since` (\"2025-07-01\") — which are ANDed together and quoted for \
+                    you: {\"from\": \"John Smith\"} works as written. For anything they \
+                    don't cover, `query` takes a raw IMAP SEARCH key instead (e.g. \
+                    \"UNSEEN\", \"OR SEEN FLAGGED\"); it cannot be combined with them. \
+                    With no filter, searches everything. Returns \
                     {\"results\": [...newest-first summaries...], \"total\": <matches \
                     before the limit>, \"truncated\": <bool>}. `limit` defaults to 10 \
                     and is capped at 50, so a large mailbox is always cut: when \
                     `truncated` is true, `results` is only the newest slice of `total` \
-                    matches — narrow the query or page by UID rather than assuming you \
+                    matches — narrow the search or page by UID rather than assuming you \
                     have seen everything.",
                 "inputSchema": input_schema::<SearchRequest>(),
                 "annotations": { "readOnlyHint": true },

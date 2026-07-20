@@ -120,6 +120,56 @@ async fn search_with_bare_word_criteria_is_bad_request() {
     );
 }
 
+/// A raw `query` combined with the structured params is refused before any IMAP call:
+/// silently honouring one half would leave the caller unable to tell which filter ran.
+#[tokio::test]
+async fn search_with_query_and_structured_params_is_bad_request() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"query":"UNSEEN","from":"John Smith"}"#))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "bad_request");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("`query`") && message.contains("from"),
+        "message should name both halves of the conflict, got: {message}"
+    );
+}
+
+/// An unparseable `since` is caught here rather than becoming an opaque server
+/// rejection — the caller gets the two accepted date formats named.
+#[tokio::test]
+async fn search_with_unparseable_since_is_bad_request() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"since":"last week"}"#))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "bad_request");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("2025-07-01") && message.contains("1-Jul-2025"),
+        "message should name both accepted formats, got: {message}"
+    );
+}
+
 /// `/email/get` without the required `uid` is a typed `bad_request` (SPEC §6, §7),
 /// even when a valid mailbox credential is present — no IMAP call is attempted.
 #[tokio::test]
