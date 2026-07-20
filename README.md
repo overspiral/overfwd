@@ -147,6 +147,9 @@ curl -sS http://localhost:8000/email/send \
        "subject":"Hello from overfwd","text":"Sent through the gateway."}'
 ```
 
+`to`, `cc` and `bcc` each accept either an array or a single string, which is split on
+commas — `"to":"dest@example.com, other@example.com"` is equivalent to the array form.
+
 ## Test
 
 ```bash
