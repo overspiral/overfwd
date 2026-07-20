@@ -94,6 +94,32 @@ async fn invalid_json_body_is_typed_bad_request() {
     assert_eq!(body_json(response).await["code"], "bad_request");
 }
 
+/// A `query` that is not an IMAP SEARCH key is refused with a typed `bad_request`
+/// before any IMAP connection is attempted — the caller must be able to tell "your
+/// syntax was wrong" from "nothing matched" (SPEC §7).
+#[tokio::test]
+async fn search_with_bare_word_criteria_is_bad_request() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"query":"John Smith"}"#))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "bad_request");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains(r#"FROM "John Smith""#),
+        "message should name the fix, got: {message}"
+    );
+}
+
 /// `/email/get` without the required `uid` is a typed `bad_request` (SPEC §6, §7),
 /// even when a valid mailbox credential is present — no IMAP call is attempted.
 #[tokio::test]

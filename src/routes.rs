@@ -71,18 +71,19 @@ pub fn router(state: AppState) -> Router {
 
 /// Request schema for `POST /email/search` (SPEC §6).
 ///
-/// `query` is a raw IMAP SEARCH key (`ALL`, `UNSEEN`, `SUBJECT "hi"`, …); it is the
-/// caller's responsibility to form a valid key. `criteria` is accepted as an alias.
-/// A `query` that is absent, `null`, or blank means `ALL` — see
-/// [`SearchRequest::effective_query`]. `folder` defaults to the mailbox's `INBOX`.
+/// `query` is a raw IMAP SEARCH key (`ALL`, `UNSEEN`, `SUBJECT "hi"`, …); a bare
+/// phrase like `John Smith` is rejected up front with a `bad_request` naming the fix —
+/// see [`SearchRequest::validated_query`]. `criteria` is accepted as an alias.
+/// A `query` that is absent, `null`, or blank means `ALL`. `folder` defaults to the
+/// mailbox's `INBOX`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct SearchRequest {
     /// Mailbox to search; defaults to [`imap::DEFAULT_MAILBOX`] (`INBOX`).
     #[serde(default)]
     #[schema(example = "INBOX")]
     folder: Option<String>,
-    /// Raw IMAP SEARCH key. Absent, `null`, or blank means `ALL`; also accepted as
-    /// `criteria`.
+    /// Raw IMAP SEARCH key, e.g. `UNSEEN` or `FROM "John Smith"`. Absent, `null`, or
+    /// blank means `ALL`; also accepted as `criteria`.
     #[serde(default, alias = "criteria")]
     #[schema(example = "UNSEEN")]
     query: Option<String>,
@@ -95,15 +96,82 @@ pub(crate) struct SearchRequest {
 /// The IMAP SEARCH key meaning "every message in the mailbox".
 const ALL_SEARCH_QUERY: &str = "ALL";
 
+/// The SEARCH keys of RFC 3501 §6.4.4 — every word that may legally *begin* a search
+/// key. Used only to catch the common "caller typed a bare phrase" mistake; the
+/// server remains the authority on the rest of the grammar.
+const SEARCH_KEYS: &[&str] = &[
+    "ALL",
+    "ANSWERED",
+    "BCC",
+    "BEFORE",
+    "BODY",
+    "CC",
+    "DELETED",
+    "DRAFT",
+    "FLAGGED",
+    "FROM",
+    "HEADER",
+    "KEYWORD",
+    "LARGER",
+    "NEW",
+    "NOT",
+    "OLD",
+    "OLDER",
+    "ON",
+    "OR",
+    "RECENT",
+    "SEEN",
+    "SENTBEFORE",
+    "SENTON",
+    "SENTSINCE",
+    "SINCE",
+    "SMALLER",
+    "SUBJECT",
+    "TEXT",
+    "TO",
+    "UID",
+    "UNANSWERED",
+    "UNDELETED",
+    "UNDRAFT",
+    "UNFLAGGED",
+    "UNKEYWORD",
+    "UNSEEN",
+    "YOUNGER",
+];
+
 impl SearchRequest {
     /// The SEARCH key to send. An absent, `null`, or blank `query` all say the same
     /// thing — the caller wants everything — so they normalize to `ALL` rather than
     /// reaching IMAP as an empty (invalid) key.
-    fn effective_query(&self) -> &str {
-        match self.query.as_deref().map(str::trim) {
+    ///
+    /// A non-blank query must *start* like a search key, otherwise the caller gets a
+    /// [`GatewayError::BadRequest`] naming the problem and the fix. Without this a
+    /// bare phrase comes back as an empty result set, indistinguishable from "nothing
+    /// matched". Only the leading token is checked: validating the whole grammar here
+    /// would reject legitimate-but-exotic queries (unquoted `HEADER` arguments, server
+    /// extension keys), and a deeper mistake still surfaces as a `bad_request` when the
+    /// server rejects it (see `map_command_err` in [`crate::imap`]).
+    fn validated_query(&self) -> Result<&str, GatewayError> {
+        let query = match self.query.as_deref().map(str::trim) {
             Some(query) if !query.is_empty() => query,
-            _ => ALL_SEARCH_QUERY,
+            _ => return Ok(ALL_SEARCH_QUERY),
+        };
+
+        let head = query.split_whitespace().next().unwrap_or(query);
+        let is_key = SEARCH_KEYS.contains(&head.to_ascii_uppercase().as_str());
+        // A bare sequence set (`1:*`, `4,9`) is a valid key, and a parenthesized group
+        // hands the inner key to the server.
+        let is_sequence_set = head
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ',' | ':' | '*'));
+        if is_key || is_sequence_set || head.starts_with('(') {
+            return Ok(query);
         }
+
+        Err(GatewayError::BadRequest(format!(
+            "invalid criteria: {query:?} — bare words are not IMAP SEARCH keys. \
+             Did you mean FROM {query:?} or TEXT {query:?}?"
+        )))
     }
 }
 
@@ -125,7 +193,7 @@ impl SearchRequest {
     ),
     responses(
         (status = 200, description = "Newest-first message summaries (clamped to `limit`).", body = Vec<MessageSummary>),
-        (status = 400, description = "`bad_request` — missing/malformed mailbox headers or JSON body.", body = ErrorResponse),
+        (status = 400, description = "`bad_request` — missing/malformed mailbox headers or JSON body, or a `query` that is not a valid IMAP SEARCH key.", body = ErrorResponse),
         (status = 401, description = "`unauthorized` — missing/invalid gateway bearer key (Axis-1).", body = ErrorResponse),
         (status = 404, description = "`not_found` — the requested mailbox does not exist.", body = ErrorResponse),
         (status = 502, description = "`auth_failure` / `host_unreachable` / `tls_failure` — the mailbox provider rejected the credential or was unreachable.", body = ErrorResponse),
@@ -155,7 +223,7 @@ pub(crate) async fn do_search(
     let settings = ImapSettings::from_env();
     let folder = request.folder.as_deref().unwrap_or(imap::DEFAULT_MAILBOX);
     let mut summaries =
-        imap::search(credential, &settings, folder, request.effective_query()).await?;
+        imap::search(credential, &settings, folder, request.validated_query()?).await?;
 
     // The IMAP layer returns ascending UID (newest-last) and leaves ordering to us
     // (SPEC §4). Present newest-first, then clamp — so `limit` keeps the newest N.
@@ -312,6 +380,14 @@ mod tests {
         serde_json::from_str(body).expect("body should deserialize")
     }
 
+    /// The query a body would send to IMAP, panicking if it is rejected.
+    fn query_of(body: &str) -> String {
+        parse(body)
+            .validated_query()
+            .unwrap_or_else(|e| panic!("body {body} should be accepted, got: {e}"))
+            .to_string()
+    }
+
     #[test]
     fn absent_null_and_blank_query_all_mean_all() {
         // The three ways a caller says "no filter" — a templated client emitting `""`
@@ -322,29 +398,69 @@ mod tests {
             r#"{"query":""}"#,
             r#"{"query":"   "}"#,
         ] {
-            assert_eq!(parse(body).effective_query(), "ALL", "body: {body}");
+            assert_eq!(query_of(body), "ALL", "body: {body}");
         }
     }
 
     #[test]
     fn a_real_query_is_passed_through_trimmed() {
-        assert_eq!(parse(r#"{"query":"UNSEEN"}"#).effective_query(), "UNSEEN");
-        assert_eq!(
-            parse(r#"{"query":"  UNSEEN  "}"#).effective_query(),
-            "UNSEEN"
-        );
-        assert_eq!(
-            parse(r#"{"query":"SUBJECT \"hi\""}"#).effective_query(),
-            r#"SUBJECT "hi""#
-        );
+        assert_eq!(query_of(r#"{"query":"UNSEEN"}"#), "UNSEEN");
+        assert_eq!(query_of(r#"{"query":"  UNSEEN  "}"#), "UNSEEN");
+        assert_eq!(query_of(r#"{"query":"SUBJECT \"hi\""}"#), r#"SUBJECT "hi""#);
     }
 
     #[test]
     fn criteria_alias_still_works() {
-        assert_eq!(
-            parse(r#"{"criteria":"UNSEEN"}"#).effective_query(),
-            "UNSEEN"
-        );
-        assert_eq!(parse(r#"{"criteria":""}"#).effective_query(), "ALL");
+        assert_eq!(query_of(r#"{"criteria":"UNSEEN"}"#), "UNSEEN");
+        assert_eq!(query_of(r#"{"criteria":""}"#), "ALL");
+    }
+
+    #[test]
+    fn valid_criteria_are_accepted() {
+        // Keyword case is the server's business, sequence sets and parenthesized
+        // groups are keys too, and only the leading token is inspected — so an
+        // exotic-but-legal tail must not be rejected here.
+        for query in [
+            "UNSEEN",
+            "unseen",
+            r#"FROM "John Smith""#,
+            r#"SUBJECT "hi""#,
+            "1:* NOT DELETED",
+            "(OR SEEN UNSEEN)",
+            "HEADER X-Spam-Flag YES",
+            "SINCE 1-Jul-2025",
+        ] {
+            let request = SearchRequest {
+                folder: None,
+                query: Some(query.to_string()),
+                limit: None,
+            };
+            assert_eq!(
+                request.validated_query().expect("should be accepted"),
+                query
+            );
+        }
+    }
+
+    #[test]
+    fn bare_words_are_rejected_with_a_fix_suggestion() {
+        // The mistake this guards: a bare phrase is a legal-looking body that IMAP
+        // answers with a rejection, which used to reach the caller as "no results".
+        for body in [r#"{"query":"John Smith"}"#, r#"{"criteria":"John Smith"}"#] {
+            let err = parse(body)
+                .validated_query()
+                .expect_err("bare words should be rejected");
+            assert_eq!(err.code(), "bad_request", "body: {body}");
+            let message = err.message();
+            assert!(
+                message.contains(r#""John Smith""#),
+                "message should quote the offending criteria, got: {message}"
+            );
+            assert!(
+                message.contains(r#"FROM "John Smith""#)
+                    && message.contains(r#"TEXT "John Smith""#),
+                "message should name the fix, got: {message}"
+            );
+        }
     }
 }
