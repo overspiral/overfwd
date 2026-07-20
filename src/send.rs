@@ -1,7 +1,8 @@
 //! The `send` action's request/response shapes and disclosure surface (SPEC §6).
 //!
 //! This module holds the pure, HTTP-adjacent logic of `POST /email/send`: the JSON
-//! request schema, validation into the SMTP module's typed [`OutgoingMessage`], and
+//! request schema (including the string-or-array recipient fields), validation into
+//! the SMTP module's typed [`OutgoingMessage`], and
 //! the **disclosure** a gating caller sees. The route handler ([`crate::routes`])
 //! threads the parsed mailbox credential through the SMTP module; this module never
 //! touches the network.
@@ -35,18 +36,26 @@ pub const BODY_PREVIEW_LIMIT: usize = 256;
 /// `cc`/`bcc` default to empty and `text`/`html` are optional, but at least one of
 /// `text`/`html` must be present and `to` must be non-empty — enforced by
 /// [`SendRequest::into_message`], not by serde.
+///
+/// Each recipient field accepts either a JSON array of addresses or a single string,
+/// which is split on commas the way a mail client treats a `To:` line — see
+/// [`de_recipients`].
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SendRequest {
     /// Envelope + header `From`.
     #[schema(example = "sender@example.com")]
     pub from: String,
     /// Primary recipients (`To`). Must be non-empty.
+    #[serde(deserialize_with = "de_recipients")]
+    #[schema(schema_with = recipients_schema)]
     pub to: Vec<String>,
     /// Carbon-copy recipients (`Cc`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_recipients")]
+    #[schema(schema_with = recipients_schema)]
     pub cc: Vec<String>,
     /// Blind-carbon-copy recipients (`Bcc`) — delivered but never written to a header.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_recipients")]
+    #[schema(schema_with = recipients_schema)]
     pub bcc: Vec<String>,
     /// The `Subject` header.
     #[schema(example = "Hello from overfwd")]
@@ -57,6 +66,62 @@ pub struct SendRequest {
     /// A `text/html` body.
     #[serde(default)]
     pub html: Option<String>,
+}
+
+/// Deserialize a recipient field from either an array of addresses or a single string.
+///
+/// A bare string is split on commas and trimmed (`"a@x , b@y"` → two recipients), so
+/// callers that hand-roll JSON — or an MCP client whose model emits a plain string —
+/// get the same behaviour as a mail client's `To:` line. Array elements are taken
+/// verbatim: the array form is already explicit about where one address ends.
+///
+/// A string that yields nothing (`""`, `" , "`) deserializes to an empty `Vec` rather
+/// than a serde error, so the "at least one recipient" failure stays a
+/// [`GatewayError::BadRequest`] raised by [`SendRequest::into_message`].
+fn de_recipients<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::Many(addresses) => addresses,
+        OneOrMany::One(line) => line
+            .split(',')
+            .map(str::trim)
+            .filter(|address| !address.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
+}
+
+/// The OpenAPI schema for a recipient field: `oneOf` a comma-separated string or an
+/// array of addresses. Mirrors [`de_recipients`] so the generated document — and the
+/// MCP tool `inputSchema` derived from it ([`crate::mcp`]) — advertise both forms.
+fn recipients_schema() -> utoipa::openapi::schema::Schema {
+    use utoipa::openapi::schema::{ArrayBuilder, ObjectBuilder, OneOfBuilder, Schema, Type};
+
+    Schema::OneOf(
+        OneOfBuilder::new()
+            .item(Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(Type::String)
+                    .description(Some("A single address, or several separated by commas."))
+                    .examples(["dest@example.com, other@example.com"])
+                    .build(),
+            ))
+            .item(Schema::Array(
+                ArrayBuilder::new()
+                    .items(ObjectBuilder::new().schema_type(Type::String))
+                    .build(),
+            ))
+            .build(),
+    )
 }
 
 impl SendRequest {
@@ -216,6 +281,47 @@ mod tests {
         let mut r = request();
         r.to = vec![];
         assert_eq!(r.into_message().unwrap_err().code(), "bad_request");
+    }
+
+    fn parse(json: &str) -> SendRequest {
+        serde_json::from_str(json).expect("request parses")
+    }
+
+    #[test]
+    fn recipients_accept_a_bare_string() {
+        let r = parse(r#"{"from":"a@x","to":"b@y","subject":"s","text":"t"}"#);
+        assert_eq!(r.to, vec!["b@y"]);
+    }
+
+    #[test]
+    fn a_recipient_string_splits_on_commas_and_trims() {
+        let r = parse(r#"{"from":"a@x","to":"b@y , c@z","subject":"s","text":"t"}"#);
+        assert_eq!(r.to, vec!["b@y", "c@z"]);
+    }
+
+    #[test]
+    fn recipients_still_accept_an_array_verbatim() {
+        let r = parse(r#"{"from":"a@x","to":["b@y","c@z"],"subject":"s","text":"t"}"#);
+        assert_eq!(r.to, vec!["b@y", "c@z"]);
+    }
+
+    #[test]
+    fn an_empty_recipient_string_is_a_bad_request_not_a_parse_error() {
+        let r = parse(r#"{"from":"a@x","to":" , ","subject":"s","text":"t"}"#);
+        assert!(r.to.is_empty());
+        assert_eq!(r.into_message().unwrap_err().code(), "bad_request");
+    }
+
+    #[test]
+    fn cc_and_bcc_take_strings_and_still_default_to_empty() {
+        let r = parse(r#"{"from":"a@x","to":"b@y","subject":"s","text":"t"}"#);
+        assert!(r.cc.is_empty() && r.bcc.is_empty());
+
+        let r = parse(
+            r#"{"from":"a@x","to":"b@y","cc":"c@z, d@z","bcc":"blind@z","subject":"s","text":"t"}"#,
+        );
+        assert_eq!(r.cc, vec!["c@z", "d@z"]);
+        assert_eq!(r.bcc, vec!["blind@z"]);
     }
 
     #[test]

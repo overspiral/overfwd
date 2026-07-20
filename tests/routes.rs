@@ -229,6 +229,38 @@ async fn send_with_no_recipients_is_bad_request() {
 }
 
 #[tokio::test]
+async fn send_accepts_a_comma_separated_recipient_string() {
+    // `to` as a bare string parses (the failure below is about the *body*, not the
+    // recipients), so a caller need not wrap a single address in an array.
+    let response = app(config(false, None))
+        .oneshot(send_request(
+            r#"{"from":"a@x","to":"b@y, c@z","subject":"s"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert_eq!(json["code"], "bad_request");
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains("body"),
+        "expected the body-required error, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn send_with_an_empty_recipient_string_is_bad_request() {
+    let response = app(config(false, None))
+        .oneshot(send_request(
+            r#"{"from":"a@x","to":"  ","subject":"s","text":"t"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "bad_request");
+}
+
+#[tokio::test]
 async fn send_with_malformed_json_is_bad_request() {
     let response = app(config(false, None))
         .oneshot(send_request("this is not json"))
