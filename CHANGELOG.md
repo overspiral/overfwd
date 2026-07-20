@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/overspiral/overfwd/compare/v0.2.0...v0.3.0) (2026-07-20)
+
+
+### Features
+
+* **auth:** opt-in SSRF gate on explicit X-Mailbox-Imap/-Smtp endpoints ([#24](https://github.com/overspiral/overfwd/issues/24)) ([96d60e2](https://github.com/overspiral/overfwd/commit/96d60e299d7ad0722fc8c3a12baad6942ea25fcb))
+
 ## [0.2.0](https://github.com/overspiral/overfwd/compare/v0.1.0...v0.2.0) (2026-07-13)
 
 
