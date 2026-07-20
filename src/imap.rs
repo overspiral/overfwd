@@ -674,11 +674,18 @@ fn map_select_err(err: ImapError, mailbox: &str) -> GatewayError {
     }
 }
 
-/// Map a SEARCH/FETCH failure. Transport errors → `host_unreachable`; a `NO`
-/// (referencing an unknown mailbox/message) → `not_found`.
+/// Map a SEARCH/FETCH failure. A `NO`/`BAD`/`Validate` means the server rejected the
+/// arguments we were given — by this point the mailbox itself is known to exist (SELECT
+/// already succeeded, see [`map_select_err`]), so the fault is the caller's criteria →
+/// `bad_request`. Transport errors → `host_unreachable`.
 fn map_command_err(err: ImapError) -> GatewayError {
     match err {
-        ImapError::No(m) => GatewayError::NotFound(format!("IMAP command rejected: {m}")),
+        ImapError::No(m) | ImapError::Bad(m) => {
+            GatewayError::BadRequest(format!("IMAP rejected the command: {m}"))
+        }
+        ImapError::Validate(e) => {
+            GatewayError::BadRequest(format!("invalid character in IMAP command: {e}"))
+        }
         ImapError::Io(e) => GatewayError::HostUnreachable(format!("IMAP command failed: {e}")),
         ImapError::ConnectionLost => GatewayError::HostUnreachable("IMAP connection lost".into()),
         other => GatewayError::HostUnreachable(format!("IMAP command failed: {other}")),
@@ -697,6 +704,29 @@ Message-ID: <abc@example.com>\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 Hey Bob, are you free for lunch tomorrow at noon?\r\n";
+
+    /// A server rejection of SEARCH/FETCH is the caller's syntax problem, not the
+    /// network's: SELECT has already proven the mailbox exists, so `NO` and `BAD` both
+    /// mean "these arguments are wrong". Only genuine transport faults stay 502.
+    #[test]
+    fn command_rejection_is_bad_request_and_transport_faults_are_not() {
+        for err in [
+            ImapError::No("SEARCH failed".into()),
+            ImapError::Bad("Invalid search criteria".into()),
+        ] {
+            let mapped = map_command_err(err);
+            assert_eq!(mapped.code(), "bad_request", "got: {mapped}");
+        }
+
+        assert_eq!(
+            map_command_err(ImapError::ConnectionLost).code(),
+            "host_unreachable"
+        );
+        assert_eq!(
+            map_command_err(ImapError::Io(std::io::Error::other("boom"))).code(),
+            "host_unreachable"
+        );
+    }
 
     #[test]
     fn tls_mode_inferred_from_port() {
