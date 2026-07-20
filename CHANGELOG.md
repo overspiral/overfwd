@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/overspiral/overfwd/compare/v0.3.0...v0.4.0) (2026-07-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **search:** `POST /email/search` returns `{results, total, truncated}` instead of a bare array of summaries; callers reading `json[0]` must read `json["results"][0]`. An unqualified search now returns 10 rows rather than the whole mailbox.
+
+### Features
+
+* **search:** default limit of 10, hard cap of 50, visible truncation ([#30](https://github.com/overspiral/overfwd/issues/30)) ([e70322c](https://github.com/overspiral/overfwd/commit/e70322c69a9d910e5c71a488570000ff4873ae1f))
+* **send:** accept to/cc/bcc as a comma-separated string ([#28](https://github.com/overspiral/overfwd/issues/28)) ([9d09a0f](https://github.com/overspiral/overfwd/commit/9d09a0fb0c98c399072e53cc5c452c3c1bb358e9))
+
+
+### Bug Fixes
+
+* **search:** reject invalid IMAP SEARCH criteria with a typed 400 ([#29](https://github.com/overspiral/overfwd/issues/29)) ([20634e5](https://github.com/overspiral/overfwd/commit/20634e59cef8d0bf6e807f84c06ece8e05475039))
+* **search:** treat a blank or null `query` as `ALL` ([#27](https://github.com/overspiral/overfwd/issues/27)) ([36034f2](https://github.com/overspiral/overfwd/commit/36034f2a1500cb4d5e674328b9e80f02f5ebf07b))
+
 ## [0.3.0](https://github.com/overspiral/overfwd/compare/v0.2.0...v0.3.0) (2026-07-20)
 
 
