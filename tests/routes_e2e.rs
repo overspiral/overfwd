@@ -24,6 +24,7 @@ use overfwd::auth::{
     HostPort, MailboxCredential, Secret, H_MAILBOX_AUTH, H_MAILBOX_IMAP, H_MAILBOX_SMTP,
 };
 use overfwd::imap::{connect, login, TlsMode, DEFAULT_MAILBOX};
+use overfwd::routes::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT};
 use overfwd::{app, Config};
 use tower::ServiceExt;
 
@@ -90,6 +91,28 @@ async fn append_message(raw: &str) {
     let _ = session.logout().await;
 }
 
+/// APPEND `count` messages sharing `subject` as a prefix, over a single session.
+///
+/// The limit/cap tests need to seed past `MAX_SEARCH_LIMIT`; doing that through
+/// [`append_message`] would open and tear down one IMAP connection per message.
+async fn append_batch(subject: &str, count: usize) {
+    let c = cred();
+    let client = connect(&c.imap, TlsMode::for_port(c.imap.port), true)
+        .await
+        .expect("connect");
+    let mut session = login(client, &c.username, c.password.expose())
+        .await
+        .expect("login");
+    for i in 0..count {
+        let raw = sample_message(&format!("{subject}-{i}"));
+        session
+            .append(DEFAULT_MAILBOX, None, None, raw.as_bytes())
+            .await
+            .expect("append");
+    }
+    let _ = session.logout().await;
+}
+
 /// The three Inline mailbox headers for the seeded `test` account (SPEC §5).
 fn mailbox_headers(builder: axum::http::request::Builder) -> axum::http::request::Builder {
     let basic = base64::engine::general_purpose::STANDARD.encode("test:test");
@@ -130,10 +153,10 @@ async fn search_then_get_round_trips_over_http() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let summaries = body_json(response).await;
-    let hit = summaries
+    let body = body_json(response).await;
+    let hit = body["results"]
         .as_array()
-        .expect("search returns a JSON array")
+        .expect("search returns a `results` array")
         .iter()
         .find(|m| m["subject"] == subject)
         .expect("our subject present in results");
@@ -159,27 +182,161 @@ async fn search_then_get_round_trips_over_http() {
     assert!(full.get("raw").is_none(), "raw must not serialise");
 }
 
-#[tokio::test]
-#[ignore = "requires the shared GreenMail stack: make mail-up"]
-async fn search_limit_clamps_results() {
-    // Append two distinct messages sharing a subject prefix, then search with a
-    // limit of 1 and assert exactly one summary comes back.
-    let subject = unique_subject("limit");
-    append_message(&sample_message(&format!("{subject}-a"))).await;
-    append_message(&sample_message(&format!("{subject}-b"))).await;
-
-    let query = format!(r#"{{"query":"SUBJECT \"{subject}\"","limit":1}}"#);
+/// Search for `subject` with an optional `limit`, returning the response envelope.
+async fn search_envelope(subject: &str, limit: Option<usize>) -> serde_json::Value {
+    let limit = match limit {
+        Some(n) => format!(r#","limit":{n}"#),
+        None => String::new(),
+    };
+    let query = format!(r#"{{"query":"SUBJECT \"{subject}\""{limit}}}"#);
     let response = app(gateway_config())
         .oneshot(read_request("/email/search", query))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let summaries = body_json(response).await;
+    body_json(response).await
+}
+
+fn result_count(envelope: &serde_json::Value) -> usize {
+    envelope["results"]
+        .as_array()
+        .expect("search returns a `results` array")
+        .len()
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_limit_clamps_results_and_marks_truncation() {
+    // Three messages share a subject prefix; asking for one must return one — and say
+    // so, rather than leaving the caller to believe it saw the whole match set. `total`
+    // counts *matches*, not returned rows, which is what makes the flag actionable.
+    let subject = unique_subject("limit");
+    append_batch(&subject, 3).await;
+
+    let envelope = search_envelope(&subject, Some(1)).await;
+    assert_eq!(result_count(&envelope), 1, "limit=1 returns one summary");
+    assert_eq!(envelope["total"], 3, "total counts every match");
+    assert_eq!(envelope["truncated"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_under_limit_is_not_marked_truncated() {
+    // The companion case: when everything fit, `truncated` must be false and `total`
+    // must agree with the row count — otherwise the flag would be noise.
+    let subject = unique_subject("untruncated");
+    append_message(&sample_message(&subject)).await;
+
+    let envelope = search_envelope(&subject, Some(DEFAULT_SEARCH_LIMIT)).await;
+    assert_eq!(result_count(&envelope), 1);
+    assert_eq!(envelope["total"], 1);
+    assert_eq!(envelope["truncated"], false);
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_limit_over_cap_is_clamped_not_rejected() {
+    // Seed *more than the cap* under one subject: a smaller corpus would make the
+    // "at most MAX_SEARCH_LIMIT rows" assertion vacuously true and the test would pass
+    // just as happily with no cap at all.
+    let subject = unique_subject("over-cap");
+    let seeded = MAX_SEARCH_LIMIT + 3;
+    append_batch(&subject, seeded).await;
+
+    let envelope = search_envelope(&subject, Some(5000)).await;
     assert_eq!(
-        summaries.as_array().map(Vec::len),
-        Some(1),
-        "limit=1 should return exactly one summary"
+        result_count(&envelope),
+        MAX_SEARCH_LIMIT,
+        "an over-cap limit must clamp to exactly the cap"
     );
+    assert_eq!(
+        envelope["total"], seeded,
+        "total still reports every match, uncapped"
+    );
+    assert_eq!(
+        envelope["truncated"], true,
+        "clamping to the cap is truncation and must be advertised"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_without_limit_applies_the_default() {
+    // An absent `limit` does not mean "every match": the route's default applies. Seed
+    // past the default so the bound is actually exercised rather than coincidental.
+    let subject = unique_subject("default-limit");
+    let seeded = DEFAULT_SEARCH_LIMIT + 2;
+    append_batch(&subject, seeded).await;
+
+    let envelope = search_envelope(&subject, None).await;
+    assert_eq!(
+        result_count(&envelope),
+        DEFAULT_SEARCH_LIMIT,
+        "an unqualified search is bounded by the default limit"
+    );
+    assert_eq!(envelope["total"], seeded);
+    assert_eq!(envelope["truncated"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn broad_search_without_limit_stays_bounded() {
+    // The same default, over the whole shared mailbox rather than a seeded subject —
+    // the shape a real caller hits when it just asks for "everything".
+    let response = app(gateway_config())
+        .oneshot(read_request(
+            "/email/search",
+            r#"{"query":"ALL"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let envelope = body_json(response).await;
+    assert!(
+        result_count(&envelope) <= DEFAULT_SEARCH_LIMIT,
+        "the default limit should bound an unqualified search, got {}",
+        result_count(&envelope)
+    );
+    // `total` is the pre-limit match count, so it is never smaller than what we got.
+    let total = envelope["total"].as_u64().expect("total present") as usize;
+    assert!(total >= result_count(&envelope));
+    assert_eq!(envelope["truncated"], total > result_count(&envelope));
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn empty_query_searches_everything() {
+    // A blank `query` is how templated clients and MCP agents spell "no filter": it
+    // must normalize to the IMAP `ALL` key, not reach the provider as an empty (and
+    // invalid) SEARCH key — which the server would answer with `BAD`, surfacing here as
+    // a 5xx rather than a 200 with matches.
+    //
+    // The assertion is on `total` (the pre-limit match count), not on finding a
+    // specific message in `results`: sibling tests on this shared, un-reset mailbox
+    // seed past the default limit, so whether any one message falls inside the
+    // newest-N window is not this test's business. Exact `ALL` equivalence is pinned
+    // without a server by `absent_null_and_blank_query_all_mean_all` in `src/routes.rs`.
+    let subject = unique_subject("empty-query");
+    append_message(&sample_message(&subject)).await;
+
+    // `limit: 0` keeps this to SEARCH alone — no bodies fetched just to count.
+    for body in [
+        r#"{"query":"","limit":0}"#,
+        r#"{"query":"   ","limit":0}"#,
+        r#"{"query":null,"limit":0}"#,
+        r#"{"limit":0}"#,
+    ] {
+        let response = app(gateway_config())
+            .oneshot(read_request("/email/search", body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "body: {body}");
+        let response_body = body_json(response).await;
+        assert!(
+            response_body["total"].as_u64().expect("total present") >= 1,
+            "an unfiltered search should match the mail we just appended (body: {body})"
+        );
+    }
 }
 
 #[tokio::test]

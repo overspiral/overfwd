@@ -94,6 +94,32 @@ async fn invalid_json_body_is_typed_bad_request() {
     assert_eq!(body_json(response).await["code"], "bad_request");
 }
 
+/// A `query` that is not an IMAP SEARCH key is refused with a typed `bad_request`
+/// before any IMAP connection is attempted — the caller must be able to tell "your
+/// syntax was wrong" from "nothing matched" (SPEC §7).
+#[tokio::test]
+async fn search_with_bare_word_criteria_is_bad_request() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"query":"John Smith"}"#))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "bad_request");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains(r#"FROM "John Smith""#),
+        "message should name the fix, got: {message}"
+    );
+}
+
 /// `/email/get` without the required `uid` is a typed `bad_request` (SPEC §6, §7),
 /// even when a valid mailbox credential is present — no IMAP call is attempted.
 #[tokio::test]
@@ -221,6 +247,38 @@ async fn send_with_no_recipients_is_bad_request() {
     let response = app(config(false, None))
         .oneshot(send_request(
             r#"{"from":"a@x","to":[],"subject":"s","text":"t"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn send_accepts_a_comma_separated_recipient_string() {
+    // `to` as a bare string parses (the failure below is about the *body*, not the
+    // recipients), so a caller need not wrap a single address in an array.
+    let response = app(config(false, None))
+        .oneshot(send_request(
+            r#"{"from":"a@x","to":"b@y, c@z","subject":"s"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert_eq!(json["code"], "bad_request");
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains("body"),
+        "expected the body-required error, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn send_with_an_empty_recipient_string_is_bad_request() {
+    let response = app(config(false, None))
+        .oneshot(send_request(
+            r#"{"from":"a@x","to":"  ","subject":"s","text":"t"}"#,
         ))
         .await
         .unwrap();

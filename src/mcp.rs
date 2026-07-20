@@ -277,7 +277,12 @@ fn tools_list() -> Value {
                 "name": "email_search",
                 "description": "Search a mailbox folder via IMAP using a raw IMAP SEARCH \
                     key (e.g. \"ALL\", \"UNSEEN\", \"SUBJECT \\\"hi\\\"\"). Returns \
-                    newest-first message summaries, clamped to `limit`.",
+                    {\"results\": [...newest-first summaries...], \"total\": <matches \
+                    before the limit>, \"truncated\": <bool>}. `limit` defaults to 10 \
+                    and is capped at 50, so a large mailbox is always cut: when \
+                    `truncated` is true, `results` is only the newest slice of `total` \
+                    matches — narrow the query or page by UID rather than assuming you \
+                    have seen everything.",
                 "inputSchema": input_schema::<SearchRequest>(),
                 "annotations": { "readOnlyHint": true },
             },

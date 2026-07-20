@@ -60,7 +60,7 @@ unauthenticated `GET /openapi.json` route can serve as a liveness probe.
 
 | Method | Path            | Class | Behaviour            |
 |--------|-----------------|-------|----------------------|
-| `POST` | `/email/search` | read  | Search a mailbox     |
+| `POST` | `/email/search` | read  | Search a mailbox (`limit` defaults to 10, capped at 50) |
 | `POST` | `/email/get`    | read  | Fetch a message      |
 | `POST` | `/email/send`   | write | Submit a message     |
 | `POST` | `/mcp`          | —     | MCP server (JSON-RPC 2.0) exposing the three actions as tools |
@@ -139,6 +139,13 @@ curl -sS http://localhost:8000/email/search \
   -H 'Content-Type: application/json' \
   -d '{"query":"UNSEEN","limit":10}'
 
+# → {"results":[{"uid":42,"subject":"…"}, …],"total":137,"truncated":true}
+#
+# `results` is newest-first. `limit` defaults to 10 and is capped at 50 — each row
+# costs a full message fetch — so a broad query is normally cut: `total` is how many
+# actually matched and `truncated` says whether you are seeing all of them. Narrow
+# the query when it is true; do not assume `results` is the whole picture.
+
 # Send a message
 curl -sS http://localhost:8000/email/send \
   -H "X-Mailbox-Auth: Basic $AUTH" \
@@ -146,6 +153,9 @@ curl -sS http://localhost:8000/email/send \
   -d '{"from":"you@example.com","to":["dest@example.com"],
        "subject":"Hello from overfwd","text":"Sent through the gateway."}'
 ```
+
+`to`, `cc` and `bcc` each accept either an array or a single string, which is split on
+commas — `"to":"dest@example.com, other@example.com"` is equivalent to the array form.
 
 ## Test
 
