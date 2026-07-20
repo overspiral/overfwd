@@ -24,6 +24,11 @@ const HOST: &str = "localhost";
 const PLAIN_PORT: u16 = 3143;
 const TLS_PORT: u16 = 3993;
 
+/// A generous `limit` for tests that care about the search *working*, not about
+/// clamping — comfortably above what any single test appends. Truncation behaviour is
+/// covered at the route layer (`tests/routes_e2e.rs`) where the policy actually lives.
+const LIMIT: usize = 50;
+
 /// An Inline credential for the seeded `test` account, IMAP pointed at `port`.
 fn cred(port: u16) -> MailboxCredential {
     MailboxCredential {
@@ -89,14 +94,15 @@ async fn run_search_and_get(port: u16) {
 
     // search: the SUBJECT key should find exactly our just-appended message.
     let query = format!("SUBJECT \"{subject}\"");
-    let summaries = imap::search(&c, &s, DEFAULT_MAILBOX, &query)
+    let summaries = imap::search(&c, &s, DEFAULT_MAILBOX, &query, LIMIT)
         .await
         .expect("search");
     assert!(
-        !summaries.is_empty(),
+        !summaries.summaries.is_empty(),
         "search found no message for subject {subject}"
     );
     let hit = summaries
+        .summaries
         .iter()
         .find(|m| m.subject.as_deref() == Some(subject.as_str()))
         .expect("our subject present in results");
@@ -137,7 +143,7 @@ async fn search_and_get_over_implicit_tls() {
 async fn bad_credential_maps_to_auth_failure() {
     let mut c = cred(PLAIN_PORT);
     c.password = Secret::new("wrong-password".to_string());
-    let err = imap::search(&c, &insecure(), DEFAULT_MAILBOX, "ALL")
+    let err = imap::search(&c, &insecure(), DEFAULT_MAILBOX, "ALL", LIMIT)
         .await
         .expect_err("login should be rejected");
     assert_eq!(err.code(), "auth_failure", "got: {err}");
@@ -148,7 +154,7 @@ async fn bad_credential_maps_to_auth_failure() {
 async fn wrong_port_maps_to_host_unreachable() {
     // 3999 has nothing listening on it in the GreenMail stack.
     let c = cred(3999);
-    let err = imap::search(&c, &insecure(), DEFAULT_MAILBOX, "ALL")
+    let err = imap::search(&c, &insecure(), DEFAULT_MAILBOX, "ALL", LIMIT)
         .await
         .expect_err("connect should fail");
     assert_eq!(err.code(), "host_unreachable", "got: {err}");
@@ -158,7 +164,7 @@ async fn wrong_port_maps_to_host_unreachable() {
 #[ignore = "requires the shared GreenMail stack: make mail-up"]
 async fn unknown_mailbox_maps_to_not_found() {
     let c = cred(PLAIN_PORT);
-    let err = imap::search(&c, &insecure(), "No-Such-Folder", "ALL")
+    let err = imap::search(&c, &insecure(), "No-Such-Folder", "ALL", LIMIT)
         .await
         .expect_err("select of a missing mailbox should fail");
     assert_eq!(err.code(), "not_found", "got: {err}");
@@ -174,7 +180,7 @@ async fn secure_tls_rejects_self_signed_cert() {
     let secure = ImapSettings {
         tls_insecure: false,
     };
-    let err = imap::search(&c, &secure, DEFAULT_MAILBOX, "ALL")
+    let err = imap::search(&c, &secure, DEFAULT_MAILBOX, "ALL", LIMIT)
         .await
         .expect_err("self-signed cert should be rejected");
     assert_eq!(err.code(), "tls_failure", "got: {err}");
@@ -196,25 +202,28 @@ async fn pooled_search_reuses_warm_connection() {
     assert_eq!(pool.idle_count(), 0, "pool starts empty");
 
     // First call: cache miss → fresh login, then the healthy session is pooled.
-    let first = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, &query)
+    let first = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, &query, LIMIT)
         .await
         .expect("first pooled search");
-    assert!(!first.is_empty(), "first search found our message");
+    assert!(
+        !first.summaries.is_empty(),
+        "first search found our message"
+    );
     assert_eq!(pool.idle_count(), 1, "healthy session returned to the pool");
 
     // Second call: cache hit → the warm session is reused and returned again.
-    let second = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, &query)
+    let second = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, &query, LIMIT)
         .await
         .expect("second pooled search");
     assert_eq!(
-        first.len(),
-        second.len(),
+        first.summaries.len(),
+        second.summaries.len(),
         "reused connection yields the same results"
     );
     assert_eq!(pool.idle_count(), 1, "session pooled again after reuse");
 
     // get_pooled shares the same warm session.
-    let uid = second[0].uid;
+    let uid = second.summaries[0].uid;
     let full = imap::get_pooled(&pool, &c, &s, DEFAULT_MAILBOX, uid)
         .await
         .expect("pooled get");
@@ -234,7 +243,7 @@ async fn disabled_pool_falls_back_to_per_request_login() {
     let pool = ImapPool::new(PoolConfig::disabled());
     assert!(!pool.is_enabled());
 
-    let summaries = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, "ALL")
+    let summaries = imap::search_pooled(&pool, &c, &s, DEFAULT_MAILBOX, "ALL", LIMIT)
         .await
         .expect("search with pooling disabled");
     // The read still works; nothing is retained.
@@ -251,7 +260,7 @@ async fn pooled_search_on_dead_port_leaves_pool_empty() {
     // 3999 has nothing listening on it in the GreenMail stack.
     let c = cred(3999);
     let pool = ImapPool::new(PoolConfig::default());
-    let err = imap::search_pooled(&pool, &c, &insecure(), DEFAULT_MAILBOX, "ALL")
+    let err = imap::search_pooled(&pool, &c, &insecure(), DEFAULT_MAILBOX, "ALL", LIMIT)
         .await
         .expect_err("connect should fail");
     assert_eq!(err.code(), "host_unreachable", "got: {err}");

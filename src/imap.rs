@@ -11,6 +11,8 @@
 //! - Connect to GreenMail plain `3143` and implicit-TLS `3993`; TLS skips
 //!   certificate verification when `MAIL_TLS_INSECURE` is set (self-signed certs).
 //! - Reusable async primitives returning typed results (uids, raw bytes).
+//! - A `limit`-bounded [`search`]: only the newest `limit` matches are fetched, and the
+//!   full match count rides back as [`SearchResults::total`].
 //! - `mail-parser` summaries + full form.
 //! - Connection / login / TLS failures mapped onto the Foundation [`GatewayError`]
 //!   codes (`auth_failure`, `host_unreachable`, `not_found`, `tls_failure`).
@@ -199,6 +201,21 @@ pub struct MessageSummary {
     pub snippet: Option<String>,
 }
 
+/// The outcome of a bounded [`search`]: the summaries actually fetched (newest-first,
+/// at most `limit` of them) plus how many messages the SEARCH matched before the limit
+/// was applied.
+///
+/// `total` costs nothing extra: UID SEARCH returns the full matching UID set without
+/// touching a single body, so the count is exact even when only `limit` messages were
+/// fetched. It is what lets the `search` action tell a caller its list was cut.
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    /// Newest-first summaries, at most `limit` of them.
+    pub summaries: Vec<MessageSummary>,
+    /// How many messages the SEARCH matched, before `limit` was applied.
+    pub total: usize,
+}
+
 /// A full message for `get` (SPEC §6): the summary fields plus decoded bodies and
 /// the original raw bytes.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -228,20 +245,23 @@ pub struct FullMessage {
 // ---------------------------------------------------------------------------
 
 /// `search`: connect, log in, select `mailbox`, run the IMAP SEARCH `query`, and
-/// return a summary per matching message (SPEC §6 read).
+/// return summaries for the newest `limit` matches (SPEC §6 read).
 ///
 /// `query` is a raw IMAP SEARCH key (e.g. `ALL`, `SUBJECT "hi"`, `UNSEEN`); the
 /// actions task builds it from the request schema. `mailbox` defaults to
-/// [`DEFAULT_MAILBOX`] at the call site. The connection is opened fresh and closed
-/// on return (no pool yet, SPEC §4).
+/// [`DEFAULT_MAILBOX`] at the call site. `limit` bounds the **fetch**, not just the
+/// result: only the newest `limit` UIDs have their bodies pulled, so the cost of a
+/// search is bounded by the caller's own ceiling rather than by mailbox size. The
+/// connection is opened fresh and closed on return (no pool yet, SPEC §4).
 pub async fn search(
     cred: &MailboxCredential,
     settings: &ImapSettings,
     mailbox: &str,
     query: &str,
-) -> Result<Vec<MessageSummary>, GatewayError> {
+    limit: usize,
+) -> Result<SearchResults, GatewayError> {
     let mut session = connect_and_login(cred, settings).await?;
-    let result = search_on(&mut session, mailbox, query).await;
+    let result = search_on(&mut session, mailbox, query, limit).await;
     logout(session).await;
     result
 }
@@ -262,22 +282,42 @@ pub async fn get(
     result
 }
 
-/// Run SEARCH + FETCH on an already-selected session. Split out so both the public
-/// [`search`] and tests can drive it without re-opening a connection.
+/// Run SEARCH + a bounded FETCH on an already-selected session. Split out so both the
+/// public [`search`] and tests can drive it without re-opening a connection.
+///
+/// Ordering lives here rather than in the caller because the layer that decides *which*
+/// `limit` UIDs to fetch has to know which end of the list is newest. UIDs are assigned
+/// in ascending arrival order, so descending UID is newest-first.
 async fn search_on(
     session: &mut ImapSession,
     mailbox: &str,
     query: &str,
-) -> Result<Vec<MessageSummary>, GatewayError> {
+    limit: usize,
+) -> Result<SearchResults, GatewayError> {
     select(session, mailbox).await?;
     let mut uids = uid_search(session, query).await?;
-    if uids.is_empty() {
-        return Ok(Vec::new());
+    // SEARCH returns the whole matching UID set without touching a body, so this count
+    // is exact and free — it survives the truncation below to become `total`.
+    let total = uids.len();
+    if uids.is_empty() || limit == 0 {
+        return Ok(SearchResults {
+            summaries: Vec::new(),
+            total,
+        });
     }
-    // Stable, newest-last order; the actions task can reverse/paginate later.
-    uids.sort_unstable();
+
+    // Newest-first, then clamp the *UID list* — everything past `limit` is never
+    // fetched, so an unbounded mailbox does not become an unbounded BODY.PEEK[] fetch.
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    uids.truncate(limit);
+
     let raws = uid_fetch_raw(session, &uids).await?;
-    Ok(raws.iter().map(|m| parse_summary(m.uid, &m.raw)).collect())
+    let mut summaries: Vec<MessageSummary> =
+        raws.iter().map(|m| parse_summary(m.uid, &m.raw)).collect();
+    // FETCH may answer in any order; re-establish newest-first over what came back.
+    summaries.sort_unstable_by_key(|m| std::cmp::Reverse(m.uid));
+
+    Ok(SearchResults { summaries, total })
 }
 
 /// Fetch a single message by UID on an already-connected session.
@@ -309,9 +349,10 @@ pub async fn search_pooled(
     settings: &ImapSettings,
     mailbox: &str,
     query: &str,
-) -> Result<Vec<MessageSummary>, GatewayError> {
+    limit: usize,
+) -> Result<SearchResults, GatewayError> {
     let mut session = acquire(pool, cred, settings).await?;
-    let result = search_on(&mut session, mailbox, query).await;
+    let result = search_on(&mut session, mailbox, query, limit).await;
     release(pool, cred, session, &result).await;
     result
 }

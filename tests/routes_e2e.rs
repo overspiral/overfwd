@@ -130,10 +130,10 @@ async fn search_then_get_round_trips_over_http() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let summaries = body_json(response).await;
-    let hit = summaries
+    let body = body_json(response).await;
+    let hit = body["results"]
         .as_array()
-        .expect("search returns a JSON array")
+        .expect("search returns a `results` array")
         .iter()
         .find(|m| m["subject"] == subject)
         .expect("our subject present in results");
@@ -159,27 +159,101 @@ async fn search_then_get_round_trips_over_http() {
     assert!(full.get("raw").is_none(), "raw must not serialise");
 }
 
-#[tokio::test]
-#[ignore = "requires the shared GreenMail stack: make mail-up"]
-async fn search_limit_clamps_results() {
-    // Append two distinct messages sharing a subject prefix, then search with a
-    // limit of 1 and assert exactly one summary comes back.
-    let subject = unique_subject("limit");
-    append_message(&sample_message(&format!("{subject}-a"))).await;
-    append_message(&sample_message(&format!("{subject}-b"))).await;
-
-    let query = format!(r#"{{"query":"SUBJECT \"{subject}\"","limit":1}}"#);
+/// Search for `subject` with an optional `limit`, returning the response envelope.
+async fn search_envelope(subject: &str, limit: Option<usize>) -> serde_json::Value {
+    let limit = match limit {
+        Some(n) => format!(r#","limit":{n}"#),
+        None => String::new(),
+    };
+    let query = format!(r#"{{"query":"SUBJECT \"{subject}\""{limit}}}"#);
     let response = app(gateway_config())
         .oneshot(read_request("/email/search", query))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let summaries = body_json(response).await;
-    assert_eq!(
-        summaries.as_array().map(Vec::len),
-        Some(1),
-        "limit=1 should return exactly one summary"
+    body_json(response).await
+}
+
+fn result_count(envelope: &serde_json::Value) -> usize {
+    envelope["results"]
+        .as_array()
+        .expect("search returns a `results` array")
+        .len()
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_limit_clamps_results_and_marks_truncation() {
+    // Three messages share a subject prefix; asking for one must return one — and say
+    // so, rather than leaving the caller to believe it saw the whole match set. `total`
+    // counts *matches*, not returned rows, which is what makes the flag actionable.
+    let subject = unique_subject("limit");
+    for tag in ["a", "b", "c"] {
+        append_message(&sample_message(&format!("{subject}-{tag}"))).await;
+    }
+
+    let envelope = search_envelope(&subject, Some(1)).await;
+    assert_eq!(result_count(&envelope), 1, "limit=1 returns one summary");
+    assert_eq!(envelope["total"], 3, "total counts every match");
+    assert_eq!(envelope["truncated"], true);
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_under_limit_is_not_marked_truncated() {
+    // The companion case: when everything fit, `truncated` must be false and `total`
+    // must agree with the row count — otherwise the flag would be noise.
+    let subject = unique_subject("untruncated");
+    append_message(&sample_message(&subject)).await;
+
+    let envelope = search_envelope(&subject, Some(10)).await;
+    assert_eq!(result_count(&envelope), 1);
+    assert_eq!(envelope["total"], 1);
+    assert_eq!(envelope["truncated"], false);
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_limit_over_cap_is_clamped_not_rejected() {
+    // A caller asking for 5000 gets the cap (50), not a 400. Proving the clamp bites
+    // needs more than 50 matches, so assert the contract that holds at any mailbox
+    // size: the request succeeds and never returns more than the cap.
+    let subject = unique_subject("over-cap");
+    append_message(&sample_message(&subject)).await;
+
+    let envelope = search_envelope(&subject, Some(5000)).await;
+    assert!(
+        result_count(&envelope) <= 50,
+        "an over-cap limit must clamp to the 50 cap, got {}",
+        result_count(&envelope)
     );
+    assert_eq!(envelope["total"], 1);
+    assert_eq!(envelope["truncated"], false, "1 match fits under the cap");
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn search_without_limit_applies_the_default() {
+    // No `limit` no longer means "every match": the route's default (10) applies, so a
+    // broad `ALL` over the shared stack comes back bounded.
+    let response = app(gateway_config())
+        .oneshot(read_request(
+            "/email/search",
+            r#"{"query":"ALL"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let envelope = body_json(response).await;
+    assert!(
+        result_count(&envelope) <= 10,
+        "the default limit of 10 should bound an unqualified search, got {}",
+        result_count(&envelope)
+    );
+    // `total` is the pre-limit match count, so it is never smaller than what we got.
+    let total = envelope["total"].as_u64().expect("total present") as usize;
+    assert!(total >= result_count(&envelope));
+    assert_eq!(envelope["truncated"], total > result_count(&envelope));
 }
 
 #[tokio::test]
@@ -197,11 +271,11 @@ async fn empty_query_searches_everything() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "body: {body}");
-        let summaries = body_json(response).await;
+        let response_body = body_json(response).await;
         assert!(
-            summaries
+            response_body["results"]
                 .as_array()
-                .expect("search returns a JSON array")
+                .expect("search returns a `results` array")
                 .iter()
                 .any(|m| m["subject"] == subject),
             "an unfiltered search should include our message (body: {body})"

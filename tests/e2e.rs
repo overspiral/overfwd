@@ -63,6 +63,10 @@ const AUTH_B64: &str = "dGVzdDp0ZXN0";
 const POLL_ATTEMPTS: usize = 40;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// `limit` for the module-layer search helper. These polls hunt one unique subject, so
+/// anything above 1 does; the route-layer helper just takes the route's own default.
+const SEARCH_LIMIT: usize = 50;
+
 // --- Reachability gate ----------------------------------------------------------
 
 /// Skip the enclosing `#[tokio::test]` (returning early, so it still counts as
@@ -206,7 +210,9 @@ async fn search_for_subject(subject: &str) -> Value {
         ))
         .await;
         assert_eq!(status, StatusCode::OK, "search failed: {body}");
-        if let Some(hit) = body
+        // `search` answers with a `{results, total, truncated}` envelope, not a bare
+        // array — the rows live under `results`.
+        if let Some(hit) = body["results"]
             .as_array()
             .and_then(|rows| rows.iter().find(|m| m["subject"] == subject))
         {
@@ -245,10 +251,11 @@ async fn module_search_for_subject(
 ) -> MessageSummary {
     let query = format!("SUBJECT \"{subject}\"");
     for _ in 0..POLL_ATTEMPTS {
-        let summaries = imap::search(c, settings, DEFAULT_MAILBOX, &query)
+        let found = imap::search(c, settings, DEFAULT_MAILBOX, &query, SEARCH_LIMIT)
             .await
             .expect("imap search");
-        if let Some(hit) = summaries
+        if let Some(hit) = found
+            .summaries
             .into_iter()
             .find(|m| m.subject.as_deref() == Some(subject))
         {
