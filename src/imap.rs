@@ -296,20 +296,16 @@ async fn search_on(
 ) -> Result<SearchResults, GatewayError> {
     select(session, mailbox).await?;
     let mut uids = uid_search(session, query).await?;
-    // SEARCH returns the whole matching UID set without touching a body, so this count
-    // is exact and free — it survives the truncation below to become `total`.
-    let total = uids.len();
-    if uids.is_empty() || limit == 0 {
+
+    // Decide what to fetch *before* fetching: `uids` is narrowed in place to the newest
+    // `limit` entries, so everything past the limit never becomes a BODY.PEEK[].
+    let total = select_newest(&mut uids, limit);
+    if uids.is_empty() {
         return Ok(SearchResults {
             summaries: Vec::new(),
             total,
         });
     }
-
-    // Newest-first, then clamp the *UID list* — everything past `limit` is never
-    // fetched, so an unbounded mailbox does not become an unbounded BODY.PEEK[] fetch.
-    uids.sort_unstable_by(|a, b| b.cmp(a));
-    uids.truncate(limit);
 
     let raws = uid_fetch_raw(session, &uids).await?;
     let mut summaries: Vec<MessageSummary> =
@@ -318,6 +314,22 @@ async fn search_on(
     summaries.sort_unstable_by_key(|m| std::cmp::Reverse(m.uid));
 
     Ok(SearchResults { summaries, total })
+}
+
+/// Narrow `uids` in place to the newest `limit` of them, returning how many there were
+/// **before** narrowing.
+///
+/// This is the cost bound of a search, factored out of [`search_on`] so it is decided —
+/// and testable — without a server: whatever this leaves in `uids` is exactly what gets
+/// a `BODY.PEEK[]`, so a mailbox of any size costs at most `limit` message fetches.
+/// UIDs are assigned in ascending arrival order, so descending UID is newest-first.
+fn select_newest(uids: &mut Vec<u32>, limit: usize) -> usize {
+    // Captured before truncation: SEARCH already returned the whole matching set
+    // without touching a body, so the full count is exact and free.
+    let total = uids.len();
+    uids.sort_unstable_by_key(|uid| std::cmp::Reverse(*uid));
+    uids.truncate(limit);
+    total
 }
 
 /// Fetch a single message by UID on an already-connected session.
@@ -783,6 +795,49 @@ Hey Bob, are you free for lunch tomorrow at noon?\r\n";
         // binary MAIL_TLS_INSECURE is normally absent.)
         std::env::remove_var(ENV_TLS_INSECURE);
         assert!(!ImapSettings::from_env().tls_insecure);
+    }
+
+    /// `select_newest` is the search's cost bound: whatever it leaves in `uids` is
+    /// exactly the set that gets a full `BODY.PEEK[]` fetch.
+    #[test]
+    fn select_newest_keeps_the_newest_uids_and_drops_the_rest() {
+        // Deliberately unsorted, as an IMAP SEARCH reply may well be.
+        let mut uids = vec![3, 9, 1, 7, 5];
+        let total = select_newest(&mut uids, 2);
+        assert_eq!(uids, vec![9, 7], "newest-first, and only `limit` of them");
+        assert_eq!(
+            total, 5,
+            "total counts matches before the limit was applied"
+        );
+    }
+
+    #[test]
+    fn select_newest_bounds_the_fetch_for_a_large_match_set() {
+        // The regression this guards: a big mailbox must not become a big fetch.
+        let mut uids: Vec<u32> = (1..=5_000).collect();
+        let total = select_newest(&mut uids, 10);
+        assert_eq!(total, 5_000);
+        assert_eq!(uids.len(), 10, "only 10 messages may be fetched");
+        assert_eq!(uids[0], 5_000, "starting from the newest");
+        assert_eq!(uids[9], 4_991);
+    }
+
+    #[test]
+    fn select_newest_handles_limit_zero_and_over_length_limits() {
+        // Zero: a total-only probe fetches nothing at all.
+        let mut uids = vec![4, 2, 6];
+        assert_eq!(select_newest(&mut uids, 0), 3);
+        assert!(uids.is_empty(), "limit 0 must fetch nothing");
+
+        // A limit above the match count keeps everything, still newest-first.
+        let mut uids = vec![4, 2, 6];
+        assert_eq!(select_newest(&mut uids, 99), 3);
+        assert_eq!(uids, vec![6, 4, 2]);
+
+        // Empty match set: no panic, nothing to fetch.
+        let mut uids: Vec<u32> = Vec::new();
+        assert_eq!(select_newest(&mut uids, 10), 0);
+        assert!(uids.is_empty());
     }
 
     #[test]

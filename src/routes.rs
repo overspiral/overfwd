@@ -148,14 +148,14 @@ const SEARCH_KEYS: &[&str] = &[
 /// A default at all (rather than "everything") matters because every returned row costs
 /// a full `BODY.PEEK[]` fetch and parse against the provider — an unbounded search is an
 /// unbounded round-trip.
-const DEFAULT_SEARCH_LIMIT: usize = 10;
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 
 /// The ceiling on `limit`, whatever the caller asks for.
 ///
 /// An over-cap `limit` is clamped rather than rejected: a caller passing a large number
 /// means "give me lots", and failing that request helps no one. The clamp is never
 /// silent — [`SearchResponse::truncated`] reports it on the wire.
-const MAX_SEARCH_LIMIT: usize = 50;
+pub const MAX_SEARCH_LIMIT: usize = 50;
 
 impl SearchRequest {
     /// The SEARCH key to send. An absent, `null`, or blank `query` all say the same
@@ -219,6 +219,19 @@ pub(crate) struct SearchResponse {
     truncated: bool,
 }
 
+impl SearchResponse {
+    /// Wrap what the IMAP layer fetched, deriving `truncated` from the pre-limit match
+    /// count. The single home of that rule — [`do_search`] and its tests both come
+    /// through here, so a test cannot pass by re-implementing the comparison.
+    fn from_results(found: imap::SearchResults) -> Self {
+        SearchResponse {
+            truncated: found.total > found.summaries.len(),
+            total: found.total,
+            results: found.summaries,
+        }
+    }
+}
+
 /// `POST /email/search` — search a mailbox (read, SPEC §6).
 ///
 /// Translates to IMAP SELECT + SEARCH + a light FETCH of the newest `limit` matches,
@@ -279,11 +292,7 @@ pub(crate) async fn do_search(
     )
     .await?;
 
-    Ok(SearchResponse {
-        truncated: found.total > found.summaries.len(),
-        total: found.total,
-        results: found.summaries,
-    })
+    Ok(SearchResponse::from_results(found))
 }
 
 /// Request schema for `POST /email/get` (SPEC §6). `uid` is required.
@@ -564,12 +573,11 @@ mod tests {
         }
     }
 
-    fn envelope(results: Vec<MessageSummary>, total: usize) -> serde_json::Value {
-        let response = SearchResponse {
-            truncated: total > results.len(),
-            total,
-            results,
-        };
+    /// Build the wire body the way `do_search` does — through the production
+    /// [`SearchResponse::from_results`], so the truncation rule under test is the real
+    /// one rather than a copy of it re-derived in the test.
+    fn envelope(summaries: Vec<MessageSummary>, total: usize) -> serde_json::Value {
+        let response = SearchResponse::from_results(imap::SearchResults { summaries, total });
         serde_json::to_value(&response).expect("envelope serialises")
     }
 
@@ -584,6 +592,11 @@ mod tests {
             Some(2),
             "results must be an array under that exact key"
         );
+        // The rows themselves survive the wrapping, newest-first as the IMAP layer left
+        // them — an envelope that dropped or reordered them would still pass the
+        // counts above.
+        assert_eq!(json["results"][0]["uid"], 9);
+        assert_eq!(json["results"][1]["uid"], 8);
     }
 
     #[test]
@@ -596,6 +609,16 @@ mod tests {
         let json = envelope(Vec::new(), 0);
         assert_eq!(json["truncated"], false);
         assert_eq!(json["total"], 0);
+        assert_eq!(json["results"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// The `limit == 0` probe is the one case where zero rows coexists with a non-zero
+    /// total, so it must still be reported as truncated.
+    #[test]
+    fn zero_limit_probe_is_truncated_when_matches_exist() {
+        let json = envelope(Vec::new(), 44);
+        assert_eq!(json["total"], 44);
+        assert_eq!(json["truncated"], true);
         assert_eq!(json["results"].as_array().map(Vec::len), Some(0));
     }
 }

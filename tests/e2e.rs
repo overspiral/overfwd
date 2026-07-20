@@ -65,7 +65,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// `limit` for the module-layer search helper. These polls hunt one unique subject, so
 /// anything above 1 does; the route-layer helper just takes the route's own default.
-const SEARCH_LIMIT: usize = 50;
+const SEARCH_LIMIT: usize = overfwd::routes::MAX_SEARCH_LIMIT;
 
 // --- Reachability gate ----------------------------------------------------------
 

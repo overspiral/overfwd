@@ -24,10 +24,11 @@ const HOST: &str = "localhost";
 const PLAIN_PORT: u16 = 3143;
 const TLS_PORT: u16 = 3993;
 
-/// A generous `limit` for tests that care about the search *working*, not about
-/// clamping — comfortably above what any single test appends. Truncation behaviour is
-/// covered at the route layer (`tests/routes_e2e.rs`) where the policy actually lives.
-const LIMIT: usize = 50;
+/// The `limit` for tests that care about the search *working*, not about clamping. The
+/// route's own cap is reused so there is one definition of "a full page" in the tree;
+/// truncation behaviour itself is covered at the route layer (`tests/routes_e2e.rs`),
+/// where the policy lives.
+const LIMIT: usize = overfwd::routes::MAX_SEARCH_LIMIT;
 
 /// An Inline credential for the seeded `test` account, IMAP pointed at `port`.
 fn cred(port: u16) -> MailboxCredential {
