@@ -198,6 +198,20 @@ credential, so **the gateway never sees the consumer's tenants**.
 **Reads are ordinary `read`** and auto-approvable. The consent boundary is *whether the mailbox
 owner granted read permission at all* — not a per-fetch approval.
 
+**`search` is bounded, and says so.** Every returned row costs a full `BODY.PEEK[]` fetch and
+parse, so `limit` defaults to **10** and is hard-capped at **50**; an over-cap request is clamped,
+not rejected. Because a bounded read can silently mislead a caller into thinking it saw
+everything, `search` answers with an envelope rather than a bare array:
+
+```json
+{ "results": [ …newest-first summaries… ], "total": 137, "truncated": true }
+```
+
+`total` is the pre-limit match count (free — UID SEARCH returns it without fetching a body) and
+`truncated` is `true` whenever more matched than `results` carries. The envelope — rather than a
+response header — is what the MCP tool result carries too, so an agent consuming `email_search`
+gets the same truncation signal a REST caller does.
+
 **`send` disclosure** (for callers that surface approvals): the request discloses To / From /
 Subject plus a clamped Body; the `Basic` auth header is **redacted** from any disclosure/audit.
 

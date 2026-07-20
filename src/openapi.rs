@@ -62,6 +62,7 @@ use utoipa_swagger_ui::SwaggerUi;
     ),
     components(schemas(
         crate::routes::SearchRequest,
+        crate::routes::SearchResponse,
         crate::routes::GetRequest,
         crate::send::SendRequest,
         crate::send::SendResponse,
