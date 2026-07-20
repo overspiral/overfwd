@@ -184,6 +184,33 @@ async fn search_limit_clamps_results() {
 
 #[tokio::test]
 #[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn empty_query_searches_everything() {
+    // A blank `query` is how templated clients and MCP agents spell "no filter": it
+    // must normalize to the IMAP `ALL` key, not reach the provider as an empty (and
+    // invalid) SEARCH key. Same for an absent one.
+    let subject = unique_subject("empty-query");
+    append_message(&sample_message(&subject)).await;
+
+    for body in [r#"{"query":""}"#, r#"{}"#] {
+        let response = app(gateway_config())
+            .oneshot(read_request("/email/search", body.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "body: {body}");
+        let summaries = body_json(response).await;
+        assert!(
+            summaries
+                .as_array()
+                .expect("search returns a JSON array")
+                .iter()
+                .any(|m| m["subject"] == subject),
+            "an unfiltered search should include our message (body: {body})"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
 async fn get_unknown_uid_is_not_found() {
     // A high but syntactically valid UID (UIDs are 1..=u32::MAX) that no message
     // occupies: the FETCH returns nothing, which `get` maps to the typed `not_found`
