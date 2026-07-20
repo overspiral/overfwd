@@ -133,7 +133,13 @@ server headers required:
 ```bash
 AUTH=$(printf 'you@example.com:app-password' | base64)
 
-# Search the inbox for unread messages
+# Search the inbox — the structured params are ANDed and quoted for you
+curl -sS http://localhost:8000/email/search \
+  -H "X-Mailbox-Auth: Basic $AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"from":"John Smith","since":"2025-07-01","limit":10}'
+
+# …or drop to a raw IMAP SEARCH key for anything they don't cover
 curl -sS http://localhost:8000/email/search \
   -H "X-Mailbox-Auth: Basic $AUTH" \
   -H 'Content-Type: application/json' \
@@ -153,6 +159,13 @@ curl -sS http://localhost:8000/email/send \
   -d '{"from":"you@example.com","to":["dest@example.com"],
        "subject":"Hello from overfwd","text":"Sent through the gateway."}'
 ```
+
+`search` filters two ways, and a request may use only one of them: the structured
+`from` / `subject` / `text` / `since` params (ANDed together, quoted and escaped
+server-side; `since` takes `2025-07-01` or `1-Jul-2025`), or `query` — a raw IMAP
+SEARCH key such as `UNSEEN` or `OR SEEN FLAGGED`, for the rest of the grammar.
+Supplying both is a `400 bad_request` rather than a silent choice; supplying neither
+searches everything.
 
 `to`, `cc` and `bcc` each accept either an array or a single string, which is split on
 commas — `"to":"dest@example.com, other@example.com"` is equivalent to the array form.
