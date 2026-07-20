@@ -73,25 +73,38 @@ pub fn router(state: AppState) -> Router {
 ///
 /// `query` is a raw IMAP SEARCH key (`ALL`, `UNSEEN`, `SUBJECT "hi"`, …); it is the
 /// caller's responsibility to form a valid key. `criteria` is accepted as an alias.
-/// An absent `query` defaults to `ALL`. `folder` defaults to the mailbox's `INBOX`.
+/// A `query` that is absent, `null`, or blank means `ALL` — see
+/// [`SearchRequest::effective_query`]. `folder` defaults to the mailbox's `INBOX`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct SearchRequest {
     /// Mailbox to search; defaults to [`imap::DEFAULT_MAILBOX`] (`INBOX`).
     #[serde(default)]
     #[schema(example = "INBOX")]
     folder: Option<String>,
-    /// Raw IMAP SEARCH key. Defaults to `ALL`; also accepted as `criteria`.
-    #[serde(default = "default_search_query", alias = "criteria")]
+    /// Raw IMAP SEARCH key. Absent, `null`, or blank means `ALL`; also accepted as
+    /// `criteria`.
+    #[serde(default, alias = "criteria")]
     #[schema(example = "UNSEEN")]
-    query: String,
+    query: Option<String>,
     /// Cap on the number of summaries returned (newest first). `None` = no cap.
     #[serde(default)]
     #[schema(example = 20)]
     limit: Option<usize>,
 }
 
-fn default_search_query() -> String {
-    "ALL".to_string()
+/// The IMAP SEARCH key meaning "every message in the mailbox".
+const ALL_SEARCH_QUERY: &str = "ALL";
+
+impl SearchRequest {
+    /// The SEARCH key to send. An absent, `null`, or blank `query` all say the same
+    /// thing — the caller wants everything — so they normalize to `ALL` rather than
+    /// reaching IMAP as an empty (invalid) key.
+    fn effective_query(&self) -> &str {
+        match self.query.as_deref().map(str::trim) {
+            Some(query) if !query.is_empty() => query,
+            _ => ALL_SEARCH_QUERY,
+        }
+    }
 }
 
 /// `POST /email/search` — search a mailbox (read, SPEC §6).
@@ -141,7 +154,8 @@ pub(crate) async fn do_search(
 ) -> Result<Vec<MessageSummary>, GatewayError> {
     let settings = ImapSettings::from_env();
     let folder = request.folder.as_deref().unwrap_or(imap::DEFAULT_MAILBOX);
-    let mut summaries = imap::search(credential, &settings, folder, &request.query).await?;
+    let mut summaries =
+        imap::search(credential, &settings, folder, request.effective_query()).await?;
 
     // The IMAP layer returns ascending UID (newest-last) and leaves ordering to us
     // (SPEC §4). Present newest-first, then clamp — so `limit` keeps the newest N.
@@ -288,4 +302,49 @@ pub(crate) async fn do_send(
     );
 
     Ok(SendResponse::accepted(disclosure))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> SearchRequest {
+        serde_json::from_str(body).expect("body should deserialize")
+    }
+
+    #[test]
+    fn absent_null_and_blank_query_all_mean_all() {
+        // The three ways a caller says "no filter" — a templated client emitting `""`
+        // or `null` for an unset field must not reach IMAP as an empty SEARCH key.
+        for body in [
+            r#"{}"#,
+            r#"{"query":null}"#,
+            r#"{"query":""}"#,
+            r#"{"query":"   "}"#,
+        ] {
+            assert_eq!(parse(body).effective_query(), "ALL", "body: {body}");
+        }
+    }
+
+    #[test]
+    fn a_real_query_is_passed_through_trimmed() {
+        assert_eq!(parse(r#"{"query":"UNSEEN"}"#).effective_query(), "UNSEEN");
+        assert_eq!(
+            parse(r#"{"query":"  UNSEEN  "}"#).effective_query(),
+            "UNSEEN"
+        );
+        assert_eq!(
+            parse(r#"{"query":"SUBJECT \"hi\""}"#).effective_query(),
+            r#"SUBJECT "hi""#
+        );
+    }
+
+    #[test]
+    fn criteria_alias_still_works() {
+        assert_eq!(
+            parse(r#"{"criteria":"UNSEEN"}"#).effective_query(),
+            "UNSEEN"
+        );
+        assert_eq!(parse(r#"{"criteria":""}"#).effective_query(), "ALL");
+    }
 }
