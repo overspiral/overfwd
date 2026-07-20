@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/overspiral/overfwd/compare/v0.4.0...v0.5.0) (2026-07-20)
+
+
+### Features
+
+* **search:** add structured from/subject/text/since params ([#33](https://github.com/overspiral/overfwd/issues/33)) ([42a72e4](https://github.com/overspiral/overfwd/commit/42a72e47b0fb4ae0a34ea63e0eb94acdd7f52a38))
+
 ## [0.4.0](https://github.com/overspiral/overfwd/compare/v0.3.0...v0.4.0) (2026-07-20)
 
 
