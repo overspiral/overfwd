@@ -212,6 +212,13 @@ everything, `search` answers with an envelope rather than a bare array:
 response header — is what the MCP tool result carries too, so an agent consuming `email_search`
 gets the same truncation signal a REST caller does.
 
+**`search` filtering** has two mutually exclusive modes. The **structured** params `from`,
+`subject`, `text` and `since` are compiled server-side into a correctly quoted IMAP SEARCH key and
+ANDed together — the default affordance for a caller that doesn't speak IMAP. The **raw** `query`
+(alias `criteria`) takes an IMAP SEARCH key directly, as the escape hatch for the rest of the
+grammar. Supplying both is a `bad_request`: whichever half the gateway dropped would be invisible
+to the caller. Supplying neither means `ALL`.
+
 **`send` disclosure** (for callers that surface approvals): the request discloses To / From /
 Subject plus a clamped Body; the `Basic` auth header is **redacted** from any disclosure/audit.
 

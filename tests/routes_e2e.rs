@@ -204,6 +204,77 @@ fn result_count(envelope: &serde_json::Value) -> usize {
         .len()
 }
 
+/// Run a structured search and return the `results` rows.
+async fn structured_results(body: serde_json::Value) -> Vec<serde_json::Value> {
+    let response = app(gateway_config())
+        .oneshot(read_request("/email/search", body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "body: {body}");
+    body_json(response).await["results"]
+        .as_array()
+        .expect("search returns a `results` array")
+        .clone()
+}
+
+/// The structured params are the affordance a caller reaches for first: `{"from": …}`
+/// must find the message without anyone hand-writing IMAP syntax, and combining params
+/// must narrow (AND), not widen (OR).
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn structured_params_search_and_and_together() {
+    let subject = unique_subject("structured");
+    append_message(&sample_message(&subject)).await;
+
+    // Each param alone finds it, and so does the conjunction — including `since`, which
+    // matches on the server's INTERNALDATE (the APPEND happened just now, so any past
+    // date qualifies).
+    //
+    // `from` is spelled as the address, not the display name: GreenMail's FROM matches
+    // only the address part of the header, where RFC 3501 (and Dovecot/Gmail) match the
+    // whole header including `Alice Example`. Asserting on the display name here would
+    // test the fake server's limitation, not our compiler.
+    for body in [
+        serde_json::json!({ "subject": subject }),
+        serde_json::json!({ "from": "alice@example.com", "subject": subject }),
+        serde_json::json!({ "text": "lunch tomorrow", "subject": subject }),
+        serde_json::json!({ "subject": subject, "since": "2020-01-01" }),
+    ] {
+        let results = structured_results(body.clone()).await;
+        assert!(
+            results.iter().any(|m| m["subject"] == subject),
+            "structured search should find our message (body: {body})"
+        );
+    }
+
+    // A non-matching `from` beside the matching `subject` must yield nothing: adjacent
+    // keys are ANDed, so one miss kills the match. This is what distinguishes a real
+    // conjunction from a "match any param" search.
+    let results = structured_results(
+        serde_json::json!({ "subject": subject, "from": "nobody@example.invalid" }),
+    )
+    .await;
+    assert!(
+        !results.iter().any(|m| m["subject"] == subject),
+        "params are ANDed, so a non-matching `from` must exclude the message"
+    );
+}
+
+/// A value with spaces and embedded quotes is quoted and escaped server-side — the
+/// caller never has to know the IMAP string grammar.
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn structured_values_with_spaces_and_quotes_are_quoted() {
+    let subject = format!("{} say \"hi\" now", unique_subject("quoting"));
+    append_message(&sample_message(&subject)).await;
+
+    let results = structured_results(serde_json::json!({ "subject": subject })).await;
+    assert!(
+        results.iter().any(|m| m["subject"] == subject),
+        "a subject containing spaces and double quotes should still match"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires the shared GreenMail stack: make mail-up"]
 async fn search_limit_clamps_results_and_marks_truncation() {
