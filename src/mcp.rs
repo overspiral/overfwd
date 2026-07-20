@@ -358,7 +358,7 @@ async fn resolve_credential(
     headers: &HeaderMap,
 ) -> Result<MailboxCredential, GatewayError> {
     InlineHeaders::parse(headers)?
-        .into_credential(&state.autoconfig)
+        .into_credential(&state.autoconfig, &state.endpoints)
         .await
 }
 
