@@ -36,8 +36,12 @@
 //!
 //! The domain is caller-influenced, so the server would otherwise fetch attacker-named
 //! URLs. Two defenses: [`is_public_domain`] rejects IP literals / `localhost` / non-DNS
-//! names before any request, and the live fetcher's DNS resolver ([`SafeDnsResolver`])
-//! refuses to connect to loopback/private/link-local addresses on every hop.
+//! names before any request, and the live fetcher's DNS resolver (`SafeDnsResolver`)
+//! refuses to connect to loopback/private/link-local addresses on every hop, using
+//! the crate-wide [`crate::endpoint::is_forbidden_ip`] predicate.
+//!
+//! The *explicit* `X-Mailbox-Imap` / `X-Mailbox-Smtp` path bypasses this module
+//! entirely; [`crate::endpoint::EndpointGuard`] is its (opt-in) counterpart.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -862,7 +866,7 @@ mod tests {
 /// pure ladder logic above stays free of transport detail and easy to test with fakes.
 mod live {
     use std::error::Error;
-    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+    use std::net::{SocketAddr, ToSocketAddrs};
     use std::sync::{Arc, Once};
     use std::time::Duration;
 
@@ -870,6 +874,9 @@ mod live {
     use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
     use super::{BoxFuture, GatewayError, HttpFetcher, SrvRecord, SrvResolver};
+    // The one address predicate for the crate — shared with the explicit-endpoint
+    // guard so both SSRF paths agree on what "non-public" means.
+    use crate::endpoint::is_forbidden_ip;
 
     /// Cap on an autoconfig response body — the documents are a few KB; anything
     /// larger is treated as a non-answer (defense against a hostile endpoint).
@@ -975,38 +982,6 @@ mod live {
                     Err(e) => Err(Box::new(e) as Box<dyn Error + Send + Sync>),
                 }
             })
-        }
-    }
-
-    /// Addresses the gateway must never be tricked into connecting to.
-    fn is_forbidden_ip(ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_multicast()
-                    || v4.is_documentation()
-                    // 100.64.0.0/10 CGNAT (RFC 6598).
-                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
-                    // 0.0.0.0/8 "this network".
-                    || v4.octets()[0] == 0
-            }
-            IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    return is_forbidden_ip(IpAddr::V4(v4));
-                }
-                let seg = v6.segments();
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    // Unique local fc00::/7.
-                    || (seg[0] & 0xfe00) == 0xfc00
-                    // Link-local fe80::/10.
-                    || (seg[0] & 0xffc0) == 0xfe80
-            }
         }
     }
 

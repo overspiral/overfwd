@@ -124,7 +124,7 @@ pub(crate) async fn search(
     body: Result<Json<SearchRequest>, JsonRejection>,
 ) -> Result<Json<Vec<MessageSummary>>, GatewayError> {
     let credential = InlineHeaders::parse(&headers)?
-        .into_credential(&state.autoconfig)
+        .into_credential(&state.autoconfig, &state.endpoints)
         .await?;
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
@@ -195,7 +195,7 @@ pub(crate) async fn get(
     body: Result<Json<GetRequest>, JsonRejection>,
 ) -> Result<Json<FullMessage>, GatewayError> {
     let credential = InlineHeaders::parse(&headers)?
-        .into_credential(&state.autoconfig)
+        .into_credential(&state.autoconfig, &state.endpoints)
         .await?;
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
@@ -249,7 +249,7 @@ pub(crate) async fn send(
     body: Result<Json<SendRequest>, JsonRejection>,
 ) -> Result<Json<SendResponse>, GatewayError> {
     let credential = InlineHeaders::parse(&headers)?
-        .into_credential(&state.autoconfig)
+        .into_credential(&state.autoconfig, &state.endpoints)
         .await?;
     let Json(request) =
         body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;

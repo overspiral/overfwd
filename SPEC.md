@@ -161,6 +161,24 @@ endpoints (IMAP `993` / SMTP `465`). When no target can be resolved the request 
 `autoconfig_failed` code (§7); when there is no domain to resolve at all it stays a
 `bad_request`. Autoconfiguration is on by default and can be disabled by config.
 
+**Endpoint address policy (SSRF).** The autoconfiguration path is SSRF-defended by
+construction: only plausible public DNS domains are looked up, and the fetcher's resolver
+refuses non-public addresses on every hop. An **explicit** `X-Mailbox-Imap` / `X-Mailbox-Smtp`
+carries no such guarantee — a self-hosted gateway is *meant* to be pointed at
+`localhost:3143`. On a **shared, multi-tenant** deployment that same freedom is an SSRF
+primitive aimed at the deployment's private network and the cloud metadata endpoint
+(`169.254.169.254`). Set `block_private_endpoints` (`OVERFWD_BLOCK_PRIVATE_ENDPOINTS=true`,
+§10) to refuse any target that **is, or resolves to**, a loopback, RFC1918, link-local, CGNAT,
+IPv6 unique-local/link-local, or unspecified address, plus the `localhost` / `.local` /
+`.internal` names. Every address a name resolves to is checked, and any non-public answer
+rejects the endpoint. Autoconfig-derived targets go through the same gate — nothing else
+validates the `hostname` inside a hostile provider's `clientConfig` XML. Refusals are
+`bad_request` (§7) naming the endpoint — deliberately distinct from `host_unreachable`, so a
+consumer can tell "policy refused this" from "the provider is down". The flag defaults to
+**off**, keeping self-host and the e2e stack unchanged. Known residual: the guard resolves,
+then the IMAP/SMTP client resolves again, so DNS rebinding between the two lookups is not
+caught.
+
 A consumer that fronts many tenants (e.g. Overslash) can use a **single static gateway
 api_key** for its own identity; its tenancy is carried per-request by the differing mailbox
 credential, so **the gateway never sees the consumer's tenants**.
@@ -253,9 +271,18 @@ a consumer-side convenience, not a gateway concern.
 - **Hosted (Cloud Run)** — one shared, stateless service. The Portfolio credential store is
   **disabled**; in-memory pools are best-effort per instance under the serverless lifecycle,
   with per-request login as the fallback. Fly/GCE are unjustified without per-tenant state.
+  A shared deployment SHOULD set `OVERFWD_BLOCK_PRIVATE_ENDPOINTS=true` (§5): reachable by
+  every tenant, an explicit endpoint header is otherwise an SSRF primitive. Running without a
+  VPC connector is containment, not a substitute — the metadata endpoint stays reachable.
 - **Standalone** — the overfwd Docker image. Self-host may run with `require_api_key=false`
   (Inline only needs the `base64` credential encoding on the caller side; multi-injection of a
-  gateway api_key + mailbox creds on one request is a hosted-only concern).
+  gateway api_key + mailbox creds on one request is a hosted-only concern), and leaves
+  `block_private_endpoints` off so `localhost`/LAN mail servers stay reachable.
+
+| Axis                       | Self-host default | Shared / multi-tenant |
+|----------------------------|-------------------|-----------------------|
+| `require_api_key`          | `false`           | `true` (+ `api_key`)  |
+| `block_private_endpoints`  | `false`           | `true`                |
 
 ---
 

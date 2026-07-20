@@ -38,6 +38,7 @@ fn gateway_config() -> Config {
         require_api_key: false,
         api_key: None,
         enable_mcp: true,
+        block_private_endpoints: false,
     }
 }
 

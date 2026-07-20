@@ -14,6 +14,7 @@
 //! | [`auth::require_gateway_access`] | §5 Axis 1    | `Authorization: Bearer <api_key>` gateway-access gate, enforced only when `require_api_key`. |
 //! | [`auth::MailboxCredential`]    | §5 Axis 2 (Inline) | Parsed `X-Mailbox-Auth` / `X-Mailbox-Imap` / `X-Mailbox-Smtp`. The `Basic` value is never logged. |
 //! | [`auth::Secret`]               | §5, §6         | Redacting wrapper so mailbox passwords never reach logs or disclosures. |
+//! | [`endpoint::EndpointGuard`]    | §5, §10        | Opt-in SSRF gate on the caller-supplied `X-Mailbox-Imap`/`-Smtp` targets, for shared multi-tenant deployments. |
 //! | [`error::GatewayError`]        | §7             | Bounded, machine-readable error codes mapped to HTTP status + a stable `{ code, message }` body. |
 //! | [`imap`]                       | §4, §6         | Provider-facing IMAP client backing the two `read` actions (`search`/`get`). |
 //! | [`smtp::submit`]               | §4, §7         | Build a message (`mail-builder`) and submit it over SMTP (`lettre`), mapping transport failures onto [`GatewayError`]. |
@@ -29,6 +30,7 @@
 pub mod auth;
 pub mod autoconfig;
 pub mod config;
+pub mod endpoint;
 pub mod error;
 pub mod imap;
 pub mod mcp;
@@ -44,6 +46,7 @@ use axum::Router;
 
 pub use autoconfig::Autoconfig;
 pub use config::Config;
+pub use endpoint::EndpointGuard;
 pub use error::GatewayError;
 pub use pool::{ImapPool, PoolConfig};
 
@@ -60,6 +63,9 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Domain→provider autoconfiguration resolver (with its in-memory cache).
     pub autoconfig: Arc<Autoconfig>,
+    /// SSRF gate on the resolved provider targets. A no-op unless
+    /// `OVERFWD_BLOCK_PRIVATE_ENDPOINTS=true` (SPEC §10).
+    pub endpoints: Arc<EndpointGuard>,
 }
 
 /// Build the full application [`Router`] for the given config.
@@ -69,9 +75,11 @@ pub struct AppState {
 /// middleware ([`auth::require_gateway_access`]); the middleware is a no-op when
 /// `require_api_key` is false (SPEC §5, §10 self-host).
 pub fn app(config: Config) -> Router {
+    let endpoints = EndpointGuard::from_config(config.block_private_endpoints);
     let state = AppState {
         config: Arc::new(config),
         autoconfig: Arc::new(Autoconfig::from_env()),
+        endpoints: Arc::new(endpoints),
     };
     routes::router(state)
 }

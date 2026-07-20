@@ -18,7 +18,7 @@ use overfwd::auth::{H_MAILBOX_AUTH, H_MAILBOX_DOMAIN};
 use overfwd::autoconfig::{
     Autoconfig, AutoconfigSettings, BoxFuture, HttpFetcher, SrvRecord, SrvResolver,
 };
-use overfwd::{AppState, Config, GatewayError};
+use overfwd::{AppState, Config, EndpointGuard, GatewayError};
 use tower::ServiceExt;
 
 /// An autoconfig document that points both servers at a closed loopback port, so a
@@ -67,8 +67,10 @@ fn stub_app() -> Router {
             require_api_key: false,
             api_key: None,
             enable_mcp: true,
+            block_private_endpoints: false,
         }),
         autoconfig: Arc::new(autoconfig),
+        endpoints: Arc::new(EndpointGuard::disabled()),
     };
     overfwd::routes::router(state)
 }
