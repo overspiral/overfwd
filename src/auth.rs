@@ -24,6 +24,7 @@ use axum::response::Response;
 use base64::Engine;
 
 use crate::autoconfig::Autoconfig;
+use crate::endpoint::EndpointGuard;
 use crate::error::GatewayError;
 use crate::AppState;
 
@@ -203,18 +204,29 @@ impl InlineHeaders {
     /// Resolve into a complete [`MailboxCredential`], filling any absent host target
     /// from autoconfiguration (SPEC §5).
     ///
-    /// Fast path: when both host headers are present, no lookup happens. Otherwise the
-    /// domain (override or username `@domain`) drives [`Autoconfig::resolve`]; an
-    /// explicitly-supplied header always wins over the resolved value. Yields
-    /// [`GatewayError::BadRequest`] when there is no domain to resolve (or autoconfig
-    /// is disabled), and [`GatewayError::AutoconfigFailed`] when the lookup finds no
-    /// usable endpoint for the needed side.
+    /// Fast path: when both host headers are present, no autoconfig lookup happens.
+    /// Otherwise the domain (override or username `@domain`) drives
+    /// [`Autoconfig::resolve`]; an explicitly-supplied header always wins over the
+    /// resolved value. Yields [`GatewayError::BadRequest`] when there is no domain to
+    /// resolve (or autoconfig is disabled), and [`GatewayError::AutoconfigFailed`]
+    /// when the lookup finds no usable endpoint for the needed side.
+    ///
+    /// Whichever way each target was obtained, it is finally vetted by `endpoints`
+    /// ([`EndpointGuard`]) before it can be dialled. That guard is off by default and
+    /// a no-op then; enabled, it refuses a target that is or resolves to a non-public
+    /// address — the SSRF gate on the explicit-header path, which
+    /// [`crate::autoconfig`]'s own defenses never covered. Autoconfig-derived targets
+    /// go through the same gate: nothing validates the `hostname` inside a hostile
+    /// provider's `clientConfig` XML either.
     pub async fn into_credential(
         self,
         autoconfig: &Autoconfig,
+        endpoints: &EndpointGuard,
     ) -> Result<MailboxCredential, GatewayError> {
         // Fast path — nothing to resolve.
         if let (Some(imap), Some(smtp)) = (self.imap.clone(), self.smtp.clone()) {
+            endpoints.check(H_MAILBOX_IMAP, &imap).await?;
+            endpoints.check(H_MAILBOX_SMTP, &smtp).await?;
             return Ok(MailboxCredential {
                 username: self.username,
                 password: self.password,
@@ -245,6 +257,11 @@ impl InlineHeaders {
 
         let servers = autoconfig.resolve(&domain, email.as_deref()).await?;
 
+        // Remember provenance so a refusal names the header the caller actually sent
+        // rather than a header they never supplied.
+        let imap_source = source_label(self.imap.is_some(), H_MAILBOX_IMAP, "autoconfigured IMAP");
+        let smtp_source = source_label(self.smtp.is_some(), H_MAILBOX_SMTP, "autoconfigured SMTP");
+
         let imap = self.imap.clone().or(servers.imap).ok_or_else(|| {
             GatewayError::AutoconfigFailed(format!("no IMAP endpoint resolved for '{domain}'"))
         })?;
@@ -252,12 +269,24 @@ impl InlineHeaders {
             GatewayError::AutoconfigFailed(format!("no SMTP endpoint resolved for '{domain}'"))
         })?;
 
+        endpoints.check(imap_source, &imap).await?;
+        endpoints.check(smtp_source, &smtp).await?;
+
         Ok(MailboxCredential {
             username: self.username,
             password: self.password,
             imap,
             smtp,
         })
+    }
+}
+
+/// Pick the label describing where a resolved target came from.
+fn source_label(explicit: bool, header: &'static str, derived: &'static str) -> &'static str {
+    if explicit {
+        header
+    } else {
+        derived
     }
 }
 
@@ -543,7 +572,7 @@ mod tests {
         // A disabled resolver proves the fast path never consults autoconfig.
         let cred = InlineHeaders::parse(&headers)
             .unwrap()
-            .into_credential(&testing::disabled())
+            .into_credential(&testing::disabled(), &EndpointGuard::disabled())
             .await
             .unwrap();
         assert_eq!(cred.imap.port, 3143);
@@ -556,7 +585,7 @@ mod tests {
         let headers = headers_with(&[]);
         let err = InlineHeaders::parse(&headers)
             .unwrap()
-            .into_credential(&testing::empty())
+            .into_credential(&testing::empty(), &EndpointGuard::disabled())
             .await
             .unwrap_err();
         assert_eq!(err.code(), "bad_request");
@@ -571,7 +600,10 @@ mod tests {
         );
         let cred = InlineHeaders::parse(&headers)
             .unwrap()
-            .into_credential(&testing::ispdb("fastmail.com", testing::FASTMAIL_XML))
+            .into_credential(
+                &testing::ispdb("fastmail.com", testing::FASTMAIL_XML),
+                &EndpointGuard::disabled(),
+            )
             .await
             .unwrap();
         assert_eq!(cred.imap.host, "imap.fastmail.com");
@@ -585,7 +617,10 @@ mod tests {
         let headers = headers_with(&[(H_MAILBOX_DOMAIN, "fastmail.com")]);
         let cred = InlineHeaders::parse(&headers)
             .unwrap()
-            .into_credential(&testing::ispdb("fastmail.com", testing::FASTMAIL_XML))
+            .into_credential(
+                &testing::ispdb("fastmail.com", testing::FASTMAIL_XML),
+                &EndpointGuard::disabled(),
+            )
             .await
             .unwrap();
         assert_eq!(cred.imap.host, "imap.fastmail.com");
@@ -601,7 +636,10 @@ mod tests {
         headers.insert(H_MAILBOX_IMAP, "imap.override.test:1993".parse().unwrap());
         let cred = InlineHeaders::parse(&headers)
             .unwrap()
-            .into_credential(&testing::ispdb("fastmail.com", testing::FASTMAIL_XML))
+            .into_credential(
+                &testing::ispdb("fastmail.com", testing::FASTMAIL_XML),
+                &EndpointGuard::disabled(),
+            )
             .await
             .unwrap();
         // IMAP from the header, SMTP filled from autoconfig.
@@ -619,10 +657,135 @@ mod tests {
         );
         let err = InlineHeaders::parse(&headers)
             .unwrap()
-            .into_credential(&testing::disabled())
+            .into_credential(&testing::disabled(), &EndpointGuard::disabled())
             .await
             .unwrap_err();
         assert_eq!(err.code(), "bad_request");
+    }
+
+    use crate::endpoint::testing::enforcing;
+
+    /// Resolve `X-Mailbox-Imap: <raw>` under an enforcing guard whose DNS table is
+    /// `answers`, and return the resulting error code (or `"ok"`).
+    async fn imap_header_under_guard(raw: &str, answers: &[(&str, &[&str])]) -> String {
+        let headers = headers_with(&[
+            (H_MAILBOX_IMAP, raw),
+            (H_MAILBOX_SMTP, "smtp.example.com:465"),
+        ]);
+        match InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::disabled(), &enforcing(answers))
+            .await
+        {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.code().to_string(),
+        }
+    }
+
+    /// With the flag on, an explicit header naming a non-public address is refused
+    /// before anything is dialled — the multi-tenant SSRF gate (SPEC §10).
+    #[tokio::test]
+    async fn enforcing_guard_rejects_private_explicit_endpoints() {
+        let public = &[("smtp.example.com", &["93.184.216.34"][..])];
+        for raw in [
+            "127.0.0.1:993",
+            "10.0.0.1:993",
+            "169.254.169.254:80",
+            "::1:993",
+            "fd00::1:993",
+            "localhost:3143",
+        ] {
+            assert_eq!(
+                imap_header_under_guard(raw, public).await,
+                "bad_request",
+                "{raw} was not refused"
+            );
+        }
+    }
+
+    /// The same headers with the guard off (the default) resolve exactly as before —
+    /// this is what keeps the GreenMail e2e stack on `localhost:3143` working.
+    #[tokio::test]
+    async fn disabled_guard_still_accepts_localhost() {
+        let headers = headers_with(&[
+            (H_MAILBOX_IMAP, "localhost:3143"),
+            (H_MAILBOX_SMTP, "localhost:3465"),
+        ]);
+        let cred = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::disabled(), &EndpointGuard::disabled())
+            .await
+            .unwrap();
+        assert_eq!(cred.imap.host, "localhost");
+        assert_eq!(cred.imap.port, 3143);
+    }
+
+    /// A public host is accepted with the guard on, and the refusal names the header
+    /// it came from without echoing the credential.
+    #[tokio::test]
+    async fn enforcing_guard_accepts_a_public_endpoint_and_names_the_header() {
+        let answers = &[
+            ("imap.example.com", &["93.184.216.34"][..]),
+            ("smtp.example.com", &["93.184.216.34"][..]),
+        ];
+        assert_eq!(
+            imap_header_under_guard("imap.example.com:993", answers).await,
+            "ok"
+        );
+
+        // A name whose A record is private — the attack the literal check misses.
+        let answers = &[
+            ("sneaky.example.com", &["10.0.0.5"][..]),
+            ("smtp.example.com", &["93.184.216.34"][..]),
+        ];
+        let headers = headers_with(&[
+            (H_MAILBOX_IMAP, "sneaky.example.com:993"),
+            (H_MAILBOX_SMTP, "smtp.example.com:465"),
+        ]);
+        let err = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::disabled(), &enforcing(answers))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "bad_request");
+        assert!(
+            err.message().contains(H_MAILBOX_IMAP),
+            "error does not name the header: {}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("test"),
+            "error leaked the credential: {}",
+            err.message()
+        );
+    }
+
+    /// An autoconfig-derived target is vetted too: nothing else validates the
+    /// `hostname` inside a hostile provider's `clientConfig` XML.
+    #[tokio::test]
+    async fn enforcing_guard_rejects_a_private_autoconfigured_endpoint() {
+        const PRIVATE_XML: &str = r#"<clientConfig version="1.1">
+  <emailProvider id="evil.test">
+    <incomingServer type="imap">
+      <hostname>169.254.169.254</hostname><port>993</port><socketType>SSL</socketType>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>169.254.169.254</hostname><port>465</port><socketType>SSL</socketType>
+    </outgoingServer>
+  </emailProvider>
+</clientConfig>"#;
+        let headers = headers_with(&[(H_MAILBOX_DOMAIN, "evil.test")]);
+        let err = InlineHeaders::parse(&headers)
+            .unwrap()
+            .into_credential(&testing::ispdb("evil.test", PRIVATE_XML), &enforcing(&[]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "bad_request");
+        assert!(
+            err.message().contains("autoconfigured IMAP"),
+            "error should name the autoconfig provenance: {}",
+            err.message()
+        );
     }
 
     #[test]

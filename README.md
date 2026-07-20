@@ -30,16 +30,26 @@ docker run -p 8000:8000 angelmanuel/overfwd:latest
 
 Configuration is entirely environment-driven — no config files. The common knobs:
 
-| Variable                 | Default        | Purpose                                            |
-|--------------------------|----------------|----------------------------------------------------|
-| `OVERFWD_BIND`           | `0.0.0.0:8000` | Listen socket.                                     |
-| `OVERFWD_REQUIRE_API_KEY`| `false`        | Require an `Authorization: Bearer` gateway key.    |
-| `OVERFWD_API_KEY`        | —              | The gateway key (required when the above is true). |
+| Variable                          | Default        | Purpose                                            |
+|-----------------------------------|----------------|----------------------------------------------------|
+| `OVERFWD_BIND`                    | `0.0.0.0:8000` | Listen socket.                                     |
+| `OVERFWD_REQUIRE_API_KEY`         | `false`        | Require an `Authorization: Bearer` gateway key.    |
+| `OVERFWD_API_KEY`                 | —              | The gateway key (required when the above is true). |
+| `OVERFWD_BLOCK_PRIVATE_ENDPOINTS` | `false`        | Refuse an `X-Mailbox-Imap`/`-Smtp` target that is, or resolves to, a non-public address. |
+
+**Running this as a shared, multi-tenant gateway?** Set
+`OVERFWD_BLOCK_PRIVATE_ENDPOINTS=true`. The endpoint headers are caller-supplied, so without
+it any caller can aim the gateway at loopback, your private network, or the cloud metadata
+endpoint (`169.254.169.254`) — an SSRF primitive. With it on, a target that *is* or *resolves
+to* a loopback / RFC1918 / link-local / CGNAT / IPv6-ULA address (or is named `localhost`,
+`*.local`, `*.internal`) is refused with `bad_request` before anything is dialled. It defaults
+to off because self-hosting against `localhost:3143` is a legitimate, common setup.
 
 ```bash
 docker run -p 8000:8000 \
   -e OVERFWD_REQUIRE_API_KEY=true \
   -e OVERFWD_API_KEY=your-secret-key \
+  -e OVERFWD_BLOCK_PRIVATE_ENDPOINTS=true \
   angelmanuel/overfwd:latest
 ```
 

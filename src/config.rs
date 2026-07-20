@@ -19,6 +19,7 @@ const ENV_BIND: &str = "OVERFWD_BIND";
 const ENV_REQUIRE_API_KEY: &str = "OVERFWD_REQUIRE_API_KEY";
 const ENV_API_KEY: &str = "OVERFWD_API_KEY";
 const ENV_ENABLE_MCP: &str = "OVERFWD_ENABLE_MCP";
+const ENV_BLOCK_PRIVATE_ENDPOINTS: &str = "OVERFWD_BLOCK_PRIVATE_ENDPOINTS";
 
 /// Immutable, process-wide server configuration (SPEC §5, §10).
 #[derive(Clone)]
@@ -36,6 +37,12 @@ pub struct Config {
     /// enabling it adds no unauthenticated surface. Set `OVERFWD_ENABLE_MCP=false` to
     /// run a pure-REST deployment.
     pub enable_mcp: bool,
+    /// Refuse an `X-Mailbox-Imap`/`X-Mailbox-Smtp` target that is, or resolves to, a
+    /// non-public address (SPEC §10). Defaults to `false`: a self-hosted gateway is
+    /// *meant* to reach `localhost:3143`, and the e2e GreenMail stack depends on it.
+    /// Turn it on for a shared, multi-tenant deployment, where an explicit endpoint
+    /// header would otherwise be an SSRF primitive ([`crate::endpoint::EndpointGuard`]).
+    pub block_private_endpoints: bool,
 }
 
 /// Errors from loading [`Config`] out of the environment.
@@ -94,11 +101,20 @@ impl Config {
             Err(_) => true,
         };
 
+        let block_private_endpoints = match std::env::var(ENV_BLOCK_PRIVATE_ENDPOINTS) {
+            Ok(v) => parse_bool(&v).ok_or(ConfigError::InvalidBool {
+                var: ENV_BLOCK_PRIVATE_ENDPOINTS,
+                value: v,
+            })?,
+            Err(_) => false,
+        };
+
         Ok(Self {
             bind,
             require_api_key,
             api_key,
             enable_mcp,
+            block_private_endpoints,
         })
     }
 }
@@ -111,6 +127,7 @@ impl std::fmt::Debug for Config {
             .field("require_api_key", &self.require_api_key)
             .field("api_key", &self.api_key)
             .field("enable_mcp", &self.enable_mcp)
+            .field("block_private_endpoints", &self.block_private_endpoints)
             .finish()
     }
 }
@@ -156,6 +173,7 @@ mod tests {
             require_api_key: true,
             api_key: Some(Secret::new("super-secret-key".to_string())),
             enable_mcp: true,
+            block_private_endpoints: false,
         };
         let rendered = format!("{cfg:?}");
         assert!(
