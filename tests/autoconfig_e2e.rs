@@ -68,6 +68,7 @@ fn stub_app() -> Router {
             api_key: None,
             enable_mcp: true,
             block_private_endpoints: false,
+            max_attachment_bytes: overfwd::config::DEFAULT_MAX_ATTACHMENT_BYTES,
         }),
         autoconfig: Arc::new(autoconfig),
         endpoints: Arc::new(EndpointGuard::disabled()),

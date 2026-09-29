@@ -21,6 +21,7 @@ fn config(require_api_key: bool, api_key: Option<&str>) -> Config {
         api_key: api_key.map(|k| overfwd::auth::Secret::new(k.to_string())),
         enable_mcp: true,
         block_private_endpoints: false,
+        max_attachment_bytes: overfwd::config::DEFAULT_MAX_ATTACHMENT_BYTES,
     }
 }
 
@@ -222,6 +223,82 @@ async fn non_json_body_is_parse_error() {
     let json = body_json(app(config(false, None)).oneshot(request).await.unwrap()).await;
     assert_eq!(json["error"]["code"], -32700);
     assert_eq!(json["id"], serde_json::Value::Null);
+}
+
+// --- Body limits -----------------------------------------------------------------
+
+const MIB: usize = 1024 * 1024;
+
+fn raw_rpc(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_large_email_send_call_is_accepted() {
+    // ~5 MiB, rejected in validation (empty `to`), which proves it got past the
+    // transport limit and the send-only gate.
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "email_send", "arguments": {
+            "from": "a@x", "to": [], "subject": "s", "text": "a".repeat(5 * MIB)
+        }}
+    });
+    let response = app(config(false, None))
+        .oneshot(raw_rpc(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["result"]["isError"], true, "{json}");
+    let text = json["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("recipient"), "{text}");
+}
+
+#[tokio::test]
+async fn a_large_call_to_another_tool_is_refused() {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "email_search", "arguments": { "query": "a".repeat(3 * MIB) } }
+    });
+    let response = app(config(false, None))
+        .oneshot(raw_rpc(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let json = body_json(response).await;
+    assert_eq!(json["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn an_mcp_body_over_the_send_limit_is_413() {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "email_send", "arguments": { "text": "a".repeat(17 * MIB) } }
+    });
+    let response = app(config(false, None))
+        .oneshot(raw_rpc(body.to_string()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn missing_json_content_type_is_still_a_parse_error() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+        .unwrap();
+    let json = body_json(app(config(false, None)).oneshot(request).await.unwrap()).await;
+    assert_eq!(json["error"]["code"], -32700);
 }
 
 #[tokio::test]

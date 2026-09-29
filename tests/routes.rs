@@ -9,6 +9,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::Engine;
 use http_body_util::BodyExt;
 use overfwd::auth::{H_MAILBOX_AUTH, H_MAILBOX_IMAP, H_MAILBOX_SMTP};
 use overfwd::{app, Config};
@@ -21,6 +22,7 @@ fn config(require_api_key: bool, api_key: Option<&str>) -> Config {
         api_key: api_key.map(|k| overfwd::auth::Secret::new(k.to_string())),
         enable_mcp: true,
         block_private_endpoints: false,
+        max_attachment_bytes: overfwd::config::DEFAULT_MAX_ATTACHMENT_BYTES,
     }
 }
 
@@ -346,6 +348,108 @@ async fn send_with_malformed_json_is_bad_request() {
     assert_eq!(body_json(response).await["code"], "bad_request");
 }
 
+// --- Body limits -------------------------------------------------------------------
+
+const MIB: usize = 1024 * 1024;
+
+/// A `send` body of roughly `size` bytes that parses but is rejected in validation
+/// (`to` is empty), so a test can tell "the transport accepted it" (400 about
+/// recipients) from "the transport refused it" (413) without any SMTP traffic.
+fn padded_send_body(size: usize) -> String {
+    format!(
+        r#"{{"from":"a@x","to":[],"subject":"s","text":"{}"}}"#,
+        "a".repeat(size)
+    )
+}
+
+fn send_request_owned(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/email/send")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn send_accepts_bodies_between_the_default_and_send_limits() {
+    for size in [3 * MIB, 15 * MIB] {
+        let response = app(config(false, None))
+            .oneshot(send_request_owned(padded_send_body(size)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "size {size}");
+        let json = body_json(response).await;
+        let message = json["message"].as_str().unwrap();
+        assert!(
+            message.contains("recipient"),
+            "a {size}-byte body should reach validation, got: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn send_accepts_a_full_default_attachment_allowance() {
+    // 10 MiB decoded = ~13.3 MiB of base64: must fit the transport limit.
+    let content = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 10 * MIB]);
+    let body = format!(
+        r#"{{"from":"a@x","to":[],"subject":"s","text":"t","attachments":[{{"filename":"f.bin","content_type":"application/octet-stream","content_base64":"{content}"}}]}}"#
+    );
+    let response = app(config(false, None))
+        .oneshot(send_request_owned(body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(
+        json["message"].as_str().unwrap().contains("recipient"),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn send_over_the_body_limit_is_413() {
+    let response = app(config(false, None))
+        .oneshot(send_request_owned(padded_send_body(17 * MIB)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(response).await["code"], "payload_too_large");
+}
+
+#[tokio::test]
+async fn the_send_limit_grows_with_the_attachment_cap() {
+    let big = Config {
+        max_attachment_bytes: 20 * MIB,
+        ..config(false, None)
+    };
+    let response = app(big)
+        .oneshot(send_request_owned(padded_send_body(17 * MIB)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn other_routes_keep_the_default_body_limit() {
+    let body = format!(r#"{{"query":"{}"}}"#, "a".repeat(3 * MIB));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/email/search")
+        .header(H_MAILBOX_AUTH, "Basic dGVzdDp0ZXN0")
+        .header(H_MAILBOX_IMAP, "localhost:3143")
+        .header(H_MAILBOX_SMTP, "localhost:3025")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let response = app(config(false, None)).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body_json(response).await["code"], "payload_too_large");
+}
+
 /// End-to-end happy path for `POST /email/send` against the shared GreenMail stack.
 ///
 /// `#[ignore]`d like the other GreenMail tests (CI does not boot the mail server):
@@ -390,4 +494,29 @@ async fn send_delivers_and_discloses_without_leaking_the_credential() {
         !rendered.contains("blind@localhost"),
         "bcc leaked: {rendered}"
     );
+}
+
+/// `POST /email/send` with an inline attachment against the shared GreenMail stack:
+/// the JSON wire shape decodes, submits, and discloses name + size but not content.
+#[tokio::test]
+#[ignore = "requires the shared GreenMail stack: make mail-up"]
+async fn send_with_an_attachment_discloses_name_and_size_only() {
+    let content = base64::engine::general_purpose::STANDARD.encode(b"ATTACHMENT-CONTENT");
+    let body = format!(
+        r#"{{"from":"test@localhost","to":"alice@localhost","subject":"routed attachment","text":"see attached","attachments":[{{"filename":"../notes.txt","content_type":"text/plain","content_base64":"{content}"}}]}}"#
+    );
+    let response = app(config(false, None))
+        .oneshot(send_request_owned(body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let json = body_json(response).await;
+    assert_eq!(
+        json["disclosure"]["attachments"],
+        serde_json::json!([{ "filename": "..notes.txt", "size_bytes": 18 }])
+    );
+    let rendered = json.to_string();
+    assert!(!rendered.contains("ATTACHMENT-CONTENT"), "{rendered}");
+    assert!(!rendered.contains(&content), "{rendered}");
 }
