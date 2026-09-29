@@ -32,10 +32,23 @@
 //! response), `ping`, `tools/list`, `tools/call`. `resources/*`, `prompts/*`,
 //! `completion/*`, and `logging/*` are intentionally unimplemented — spec-legal since
 //! the `initialize` result advertises only the `tools` capability.
+//!
+//! ## Body size
+//!
+//! `email_send` can carry inline attachments, so `POST /mcp` accepts the same raised
+//! body limit as `POST /email/send` ([`crate::routes::send_body_limit`], 16 MiB by
+//! default). Every tool shares the one endpoint, so the transport cannot tell a
+//! `send` from a `search` before reading the body. The trade-off: any caller past the
+//! Axis-1 gate can make the gateway buffer up to that limit, and only *after*
+//! parsing is a payload over the ordinary 2 MiB refused unless it consists solely of
+//! `email_send` calls. Every other tool stays bounded in what it will *act on*, but
+//! not in what the endpoint will read. The limit tracks `OVERFWD_MAX_ATTACHMENT_BYTES`,
+//! so a deployment that sets it to `0` (no attachments) brings `/mcp` back to ~2.7 MiB.
 
-use axum::extract::rejection::JsonRejection;
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -44,8 +57,8 @@ use utoipa::PartialSchema;
 
 use crate::auth::{InlineHeaders, MailboxCredential};
 use crate::error::GatewayError;
-use crate::routes::{do_get, do_search, do_send, GetRequest, SearchRequest};
-use crate::send::SendRequest;
+use crate::routes::{do_get, do_search, do_send, GetRequest, SearchRequest, DEFAULT_BODY_LIMIT};
+use crate::send::{AttachmentLimits, SendRequest};
 use crate::AppState;
 
 /// The MCP protocol revision this server implements. Bump alongside
@@ -140,24 +153,36 @@ fn error_response(
 /// single response, an array of responses, or — when the payload carried only
 /// notifications — `202 Accepted` with an empty body. A malformed body is reported as a
 /// JSON-RPC `-32700` parse error (HTTP 200), since JSON-RPC transports errors in the
-/// body, not via HTTP status.
+/// body, not via HTTP status. The exception is an oversized body, which gets HTTP
+/// `413` (carrying a JSON-RPC `-32600` body): it is a transport limit, not a message
+/// the server read — see the module docs on body size.
 pub(crate) async fn mcp_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Result<Json<Value>, JsonRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let Json(value) = match body {
-        Ok(json) => json,
-        Err(err) => {
-            let resp = error_response(
-                Value::Null,
-                PARSE_ERROR,
-                format!("parse error: {err}"),
-                None,
-            );
-            return Json(resp).into_response();
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        Err(err) if err.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return too_large(format!("request body too large: {}", err.body_text()));
         }
+        Err(err) => return parse_error(format!("parse error: {err}")),
     };
+    if !is_json_content_type(&headers) {
+        return parse_error(
+            "parse error: expected a request with `Content-Type: application/json`".to_string(),
+        );
+    }
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(err) => return parse_error(format!("parse error: {err}")),
+    };
+    if bytes.len() > DEFAULT_BODY_LIMIT && !is_send_only(&value) {
+        return too_large(format!(
+            "request body too large: only `email_send` calls may exceed {DEFAULT_BODY_LIMIT} bytes"
+        ));
+    }
+    drop(bytes);
 
     match value {
         Value::Array(items) => {
@@ -199,15 +224,60 @@ pub(crate) async fn mcp_endpoint(
     }
 }
 
+fn parse_error(message: String) -> Response {
+    Json(error_response(Value::Null, PARSE_ERROR, message, None)).into_response()
+}
+
+fn too_large(message: String) -> Response {
+    let resp = error_response(Value::Null, INVALID_REQUEST, message, None);
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(resp)).into_response()
+}
+
+/// Whether the request declares a JSON body: `application/json` or an
+/// `application/*+json` type, parameters (`; charset=utf-8`) allowed — the rule
+/// axum's own `Json` extractor applies.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// Whether a payload is nothing but `email_send` tool calls — the one tool allowed a
+/// body past [`DEFAULT_BODY_LIMIT`], because it is the one that carries attachments.
+fn is_send_only(value: &Value) -> bool {
+    let is_send_call = |item: &Value| {
+        item.get("method").and_then(Value::as_str) == Some("tools/call")
+            && item.pointer("/params/name").and_then(Value::as_str) == Some("email_send")
+    };
+    match value {
+        Value::Array(items) => !items.is_empty() && items.iter().all(is_send_call),
+        item => is_send_call(item),
+    }
+}
+
 /// Handle one JSON-RPC message. Returns `None` for notifications (no `id`) and for
 /// messages we cannot parse that lack an `id` — both of which get no response.
 async fn handle_one(state: &AppState, headers: &HeaderMap, value: Value) -> Option<RpcResponse> {
-    let request: RpcRequest = match serde_json::from_value(value.clone()) {
+    // Only the id is copied out up front — the message itself is moved into the
+    // parse, so an `email_send` carrying megabytes of attachments is never cloned.
+    let id = value.get("id").cloned();
+    let request: RpcRequest = match serde_json::from_value(value) {
         Ok(req) => req,
         Err(err) => {
             // Only answer if the client supplied an id; a malformed notification is
             // silently dropped (JSON-RPC notifications never get a response).
-            let id = value.get("id").cloned()?;
+            let id = id?;
             return Some(error_response(
                 id,
                 INVALID_REQUEST,
@@ -301,7 +371,10 @@ fn tools_list() -> Value {
             {
                 "name": "email_send",
                 "description": "Build a message and submit it over the caller's SMTP \
-                    mailbox. Returns the To/From/Subject and a clamped body preview.",
+                    mailbox. Files go in `attachments` as \
+                    [{\"filename\", \"content_type\", \"content_base64\"}] — at most 20, \
+                    10 MiB decoded in total by default. Returns the To/From/Subject, a \
+                    clamped body preview, and each attachment's filename and size.",
                 "inputSchema": input_schema::<SendRequest>(),
                 "annotations": { "readOnlyHint": false },
             },
@@ -354,7 +427,11 @@ async fn tools_call(
             Err(resp) => error_response(id, INVALID_PARAMS, resp, None),
         },
         "email_send" => match parse_arguments::<SendRequest>(&call.name, call.arguments) {
-            Ok(req) => tool_response(id, do_send(&credential, req).await),
+            Ok(req) => {
+                let limits =
+                    AttachmentLimits::with_max_total_bytes(state.config.max_attachment_bytes);
+                tool_response(id, do_send(&credential, req, &limits).await)
+            }
             Err(resp) => error_response(id, INVALID_PARAMS, resp, None),
         },
         other => error_response(id, INVALID_PARAMS, format!("unknown tool: {other}"), None),
@@ -419,4 +496,45 @@ fn gateway_protocol_error(id: Value, err: &GatewayError) -> RpcResponse {
         err.message().to_string(),
         Some(json!({ "code": err.code() })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_input_schema_documents_attachments_inline() {
+        let schema = input_schema::<SendRequest>();
+        let attachments = &schema["properties"]["attachments"];
+        assert_eq!(attachments["type"], "array", "{attachments}");
+        let item = &attachments["items"];
+        assert!(
+            !schema.to_string().contains("$ref"),
+            "the MCP inputSchema must be self-contained: {schema}"
+        );
+        for field in ["filename", "content_type", "content_base64"] {
+            assert!(item["properties"][field].is_object(), "{field}: {item}");
+        }
+        let required: Vec<&str> = item["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, ["filename", "content_type", "content_base64"]);
+    }
+
+    #[test]
+    fn only_pure_send_payloads_count_as_send_only() {
+        let send =
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"email_send"}});
+        let search =
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_search"}});
+        assert!(is_send_only(&send));
+        assert!(is_send_only(&json!([send.clone(), send.clone()])));
+        assert!(!is_send_only(&search));
+        assert!(!is_send_only(&json!([send, search])));
+        assert!(!is_send_only(&json!([])));
+        assert!(!is_send_only(&json!({"method":"initialize"})));
+    }
 }

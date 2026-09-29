@@ -219,8 +219,24 @@ ANDed together — the default affordance for a caller that doesn't speak IMAP. 
 grammar. Supplying both is a `bad_request`: whichever half the gateway dropped would be invisible
 to the caller. Supplying neither means `ALL`.
 
+**`send` attachments** are inlined, keeping the gateway stateless — no upload endpoint, no
+storage. A caller that stages files (e.g. an upstream gateway holding encrypted, TTL'd uploads)
+passes each one as `attachments: [{ filename, content_type, content_base64 }]`, and the message
+goes out `multipart/mixed` with every attachment base64-encoded, so the recipient decodes exactly
+the bytes sent. Limits: at most **20** attachments and **10 MiB decoded in total** by default
+(`OVERFWD_MAX_ATTACHMENT_BYTES`, §10). The size is checked from the base64 length before anything is
+decoded. Decoding is strict standard base64, whitespace aside; `content_type` must be a bare
+`type/subtype` (parameters dropped; `multipart/*` refused), which closes header injection; and
+`filename` is sanitized (control, bidi-override and path-separator characters stripped, clamped
+to 255 chars, `attachment` if nothing is left). Any violation is a `bad_request` naming the
+attachment by index, never echoing its content. Because base64 inflates by 4/3, `POST /email/send`
+accepts bodies up to **16 MiB** by default (growing with the attachment cap), and a larger body is
+`payload_too_large`. Every other route stays at the 2 MiB default. Reading attachments
+(`get_attachment`) remains a later addition.
+
 **`send` disclosure** (for callers that surface approvals): the request discloses To / From /
-Subject plus a clamped Body; the `Basic` auth header is **redacted** from any disclosure/audit.
+Subject plus a clamped Body, and each attachment's filename and decoded size (never its
+contents); the `Basic` auth header is **redacted** from any disclosure/audit.
 
 ### MCP surface
 
@@ -237,6 +253,12 @@ between requests. Provider failures surface as a tool result with `isError: true
 stable `{ code, message }` envelope (§7); malformed calls / missing credentials surface as
 JSON-RPC errors. The endpoint is on by default and disabled with `OVERFWD_ENABLE_MCP=false`
 (§10). It advertises only the `tools` capability (a strict subset of MCP; no resources/prompts).
+
+`email_send` carries attachments too, so `POST /mcp` shares the send body limit. One endpoint
+serves every tool, so the transport can't tell a send from a search before reading the body.
+Instead, a body over the 2 MiB default that isn't made up entirely of `email_send` calls is
+refused with HTTP 413 once parsed. The other tools stay bounded in what they act on, but the
+endpoint will still *read* up to the send limit from any caller past Axis 1.
 
 ### Later additions (not v1)
 
@@ -255,6 +277,7 @@ Bounded, typed, machine-readable error codes a caller can gate/approve/branch on
 - **mailbox / message not found**
 - **TLS failure**
 - **autoconfig failed** (host headers absent and no provider target resolvable from the domain)
+- **payload too large** (request body over the route's limit, §6)
 
 Codes are stable across gateway instances and versions.
 
@@ -305,6 +328,10 @@ a consumer-side convenience, not a gateway concern.
 | `require_api_key`          | `false`           | `true` (+ `api_key`)  |
 | `block_private_endpoints`  | `false`           | `true`                |
 
+`max_attachment_bytes` (`OVERFWD_MAX_ATTACHMENT_BYTES`, default 10 MiB) caps a `send`'s total
+decoded attachment size (§6). The `send`/`/mcp` body limit follows it: base64 of the cap plus
+~2.7 MiB of JSON headroom, which comes to 16 MiB at the default.
+
 ---
 
 ## 11. Roadmap / Deferred Tracks
@@ -314,7 +341,8 @@ Deliberate deferrals, not omissions:
 - **Own-inbox** — programmatic inbox creation/hosting.
 - **Real-time inbound** — "wake on new mail"; needs an inbound-event ingestion subsystem.
 - **Portfolio / Session modes** — standalone-product surfaces; can land after the Inline path.
-- **Attachments** (`get_attachment`, `prefer_stream`) and **`list_folders`**.
+- **Reading attachments** (`get_attachment`, `prefer_stream`) and **`list_folders`**. Sending
+  them inline on `send` is in v1 (§6).
 - **Microsoft Graph** — a separate REST track for Outlook/M365, outside this gateway.
 
 ---

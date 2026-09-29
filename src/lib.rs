@@ -18,14 +18,16 @@
 //! | [`error::GatewayError`]        | §7             | Bounded, machine-readable error codes mapped to HTTP status + a stable `{ code, message }` body. |
 //! | [`imap`]                       | §4, §6         | Provider-facing IMAP client backing the two `read` actions (`search`/`get`). |
 //! | [`smtp::submit`]               | §4, §7         | Build a message (`mail-builder`) and submit it over SMTP (`lettre`), mapping transport failures onto [`GatewayError`]. |
-//! | [`send::SendRequest`]          | §6             | The `POST /email/send` JSON schema, its validation into an `OutgoingMessage`, and the redaction-safe To/From/Subject disclosure. |
+//! | [`send::SendRequest`]          | §6             | The `POST /email/send` JSON schema (inline base64 attachments included), its validation into an `OutgoingMessage`, and the redaction-safe To/From/Subject/attachment-name disclosure. |
 //! | [`pool::ImapPool`]             | §4             | Ephemeral in-memory, per-credential, bounded/LRU/TTL'd cache of warm IMAP sessions; per-request login is the fallback. |
 //! | [`routes::router`]             | §6             | `POST /email/{search,get,send}` — all live: `search`/`get` over IMAP, `send` over SMTP. |
 //! | [`mcp::mcp_endpoint`]          | §5, §6         | The same three actions as JSON-RPC 2.0 MCP tools at `POST /mcp`, behind the Axis-1 gate. |
 //! | [`openapi::ApiDoc`]            | §6, §7         | Code-derived OpenAPI 3.1 document, served at `/openapi.json` + Swagger UI at `/docs` (both outside the Axis-1 gate). |
 //!
 //! Out of scope here (SPEC §5, §11): Portfolio/Session credential sources,
-//! multi-injection, and attachments.
+//! multi-injection, and *reading* attachments (`get_attachment`). Sending them is in
+//! scope: `send` accepts inline base64 attachments ([`send::Attachment`]), so the
+//! gateway stays stateless.
 
 pub mod auth;
 pub mod autoconfig;

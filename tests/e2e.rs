@@ -154,6 +154,7 @@ fn gateway_config() -> Config {
         api_key: None,
         enable_mcp: true,
         block_private_endpoints: false,
+        max_attachment_bytes: overfwd::config::DEFAULT_MAX_ATTACHMENT_BYTES,
     }
 }
 
@@ -453,6 +454,7 @@ async fn roundtrip_over_implicit_tls() {
             bcc: vec![],
             subject: subject.clone(),
             body: OutgoingBody::Text(body.clone()),
+            attachments: vec![],
         },
     )
     .await

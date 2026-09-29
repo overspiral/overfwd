@@ -25,8 +25,8 @@
 //! - `get` → SELECT + a single BODY.PEEK FETCH, parsed into a [`FullMessage`].
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ use utoipa::ToSchema;
 use crate::auth::{require_gateway_access, InlineHeaders, MailboxCredential};
 use crate::error::{ErrorResponse, GatewayError};
 use crate::imap::{self, FullMessage, ImapSettings, MessageSummary};
-use crate::send::{SendDisclosure, SendRequest, SendResponse};
+use crate::send::{AttachmentLimits, SendDisclosure, SendRequest, SendResponse};
 use crate::smtp::{submit, SmtpSettings};
 use crate::AppState;
 
@@ -45,10 +45,14 @@ use crate::AppState;
 /// ([`crate::openapi::openapi_router`]) are merged **outside** that gate so
 /// `/openapi.json` and `/docs` are reachable without a gateway key (SPEC §5).
 pub fn router(state: AppState) -> Router {
+    // Only the routes that can carry inline attachments get the raised body limit;
+    // `search`/`get` keep axum's 2 MiB default.
+    let send_limit = DefaultBodyLimit::max(send_body_limit(state.config.max_attachment_bytes));
+
     let email = Router::new()
         .route("/search", post(search))
         .route("/get", post(get))
-        .route("/send", post(send))
+        .route("/send", post(send).layer(send_limit))
         // Axis-1 gateway-access gate wraps every /email route (SPEC §5).
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -60,8 +64,11 @@ pub fn router(state: AppState) -> Router {
     // The MCP endpoint exposes the same three actions as JSON-RPC 2.0 tools, behind the
     // same Axis-1 gate as `/email` (SPEC §5). Off when `OVERFWD_ENABLE_MCP=false`.
     if state.config.enable_mcp {
+        // `/mcp` is one endpoint for every tool, so the limit can't be keyed on the
+        // route alone: it gets the send limit, and `mcp_endpoint` itself refuses an
+        // over-default body unless it is purely `email_send` calls.
         let mcp = Router::new()
-            .route("/mcp", post(crate::mcp::mcp_endpoint))
+            .route("/mcp", post(crate::mcp::mcp_endpoint).layer(send_limit))
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 require_gateway_access,
@@ -72,6 +79,46 @@ pub fn router(state: AppState) -> Router {
     router
         .with_state(state)
         .merge(crate::openapi::openapi_router())
+}
+
+/// axum's default request body limit, which every route except `send` and `/mcp`
+/// keeps.
+pub const DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The `send` body limit at the default attachment cap: 16 MiB.
+const DEFAULT_SEND_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Room beside the attachments for the rest of the JSON (addresses, subject, text and
+/// html bodies, field names): whatever 16 MiB leaves once a full default 10 MiB of
+/// attachments is base64-encoded, ~2.7 MiB.
+const SEND_BODY_OVERHEAD: usize =
+    DEFAULT_SEND_BODY_LIMIT - base64_len(crate::config::DEFAULT_MAX_ATTACHMENT_BYTES);
+
+/// The encoded length of `n` bytes in padded base64.
+const fn base64_len(n: usize) -> usize {
+    n.div_ceil(3).saturating_mul(4)
+}
+
+/// The request body limit of `POST /email/send` (and `POST /mcp`) for a deployment
+/// whose attachment cap is `max_attachment_bytes` decoded.
+///
+/// Base64 inflates by 4/3, so the default 10 MiB cap needs ~13.3 MiB on the wire;
+/// with `SEND_BODY_OVERHEAD` that makes 16 MiB. The limit tracks
+/// `OVERFWD_MAX_ATTACHMENT_BYTES` both ways: raising the cap never leaves a request
+/// within it refused by the transport first, and `0` (no attachments) brings the
+/// limit back down to ~2.7 MiB.
+pub fn send_body_limit(max_attachment_bytes: usize) -> usize {
+    base64_len(max_attachment_bytes).saturating_add(SEND_BODY_OVERHEAD)
+}
+
+/// Turn a JSON body rejection into a [`GatewayError`]: `413 payload_too_large` when
+/// the body blew the route's limit, `400 bad_request` for anything else.
+pub(crate) fn json_rejection(err: JsonRejection) -> GatewayError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        GatewayError::PayloadTooLarge(format!("request body too large: {}", err.body_text()))
+    } else {
+        GatewayError::BadRequest(format!("invalid JSON request body: {err}"))
+    }
 }
 
 /// Request schema for `POST /email/search` (SPEC §6).
@@ -448,8 +495,7 @@ pub(crate) async fn search(
     let credential = InlineHeaders::parse(&headers)?
         .into_credential(&state.autoconfig, &state.endpoints)
         .await?;
-    let Json(request) =
-        body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
+    let Json(request) = body.map_err(json_rejection)?;
 
     Ok(Json(do_search(&credential, request).await?))
 }
@@ -522,8 +568,7 @@ pub(crate) async fn get(
     let credential = InlineHeaders::parse(&headers)?
         .into_credential(&state.autoconfig, &state.endpoints)
         .await?;
-    let Json(request) =
-        body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
+    let Json(request) = body.map_err(json_rejection)?;
 
     Ok(Json(do_get(&credential, request).await?))
 }
@@ -562,9 +607,10 @@ pub(crate) async fn do_get(
         ("mailbox_smtp" = []),
     ),
     responses(
-        (status = 200, description = "Accepted by the provider; echoes the To/From/Subject/body-preview disclosure (SPEC §6).", body = SendResponse),
-        (status = 400, description = "`bad_request` — missing/malformed mailbox headers, empty `to`, or no body.", body = ErrorResponse),
+        (status = 200, description = "Accepted by the provider; echoes the To/From/Subject/body-preview disclosure plus each attachment's filename and size (SPEC §6).", body = SendResponse),
+        (status = 400, description = "`bad_request` — missing/malformed mailbox headers, empty `to`, no body, or an invalid attachment (bad base64, a `content_type` that is not `type/subtype`, more than 20 attachments, or more than `OVERFWD_MAX_ATTACHMENT_BYTES` decoded in total).", body = ErrorResponse),
         (status = 401, description = "`unauthorized` — missing/invalid gateway bearer key (Axis-1).", body = ErrorResponse),
+        (status = 413, description = "`payload_too_large` — the request body exceeds the send limit (16 MiB by default; grows with `OVERFWD_MAX_ATTACHMENT_BYTES`).", body = ErrorResponse),
         (status = 502, description = "`auth_failure` / `host_unreachable` / `tls_failure` — the SMTP provider rejected the credential or was unreachable.", body = ErrorResponse),
     ),
 )]
@@ -573,13 +619,15 @@ pub(crate) async fn send(
     headers: HeaderMap,
     body: Result<Json<SendRequest>, JsonRejection>,
 ) -> Result<Json<SendResponse>, GatewayError> {
+    // An oversized body is refused before anything else, credential included: the
+    // caller's fix is the payload, whatever else is wrong with the request.
+    let Json(request) = body.map_err(json_rejection)?;
     let credential = InlineHeaders::parse(&headers)?
         .into_credential(&state.autoconfig, &state.endpoints)
         .await?;
-    let Json(request) =
-        body.map_err(|err| GatewayError::BadRequest(format!("invalid JSON request body: {err}")))?;
 
-    Ok(Json(do_send(&credential, request).await?))
+    let limits = AttachmentLimits::with_max_total_bytes(state.config.max_attachment_bytes);
+    Ok(Json(do_send(&credential, request, &limits).await?))
 }
 
 /// The `send` action's business core, shared by the REST handler and the MCP tool.
@@ -591,8 +639,9 @@ pub(crate) async fn send(
 pub(crate) async fn do_send(
     credential: &MailboxCredential,
     request: SendRequest,
+    limits: &AttachmentLimits,
 ) -> Result<SendResponse, GatewayError> {
-    let message = request.into_message()?;
+    let message = request.into_message(limits)?;
     let disclosure = SendDisclosure::for_message(&message);
 
     let security = SmtpSettings::from_env().security_for(&credential.smtp);
@@ -609,6 +658,7 @@ pub(crate) async fn do_send(
         from = %disclosure.from,
         to = ?disclosure.to,
         subject = %disclosure.subject,
+        attachments = disclosure.attachments.len(),
         "send accepted by provider",
     );
 

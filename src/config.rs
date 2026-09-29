@@ -20,6 +20,11 @@ const ENV_REQUIRE_API_KEY: &str = "OVERFWD_REQUIRE_API_KEY";
 const ENV_API_KEY: &str = "OVERFWD_API_KEY";
 const ENV_ENABLE_MCP: &str = "OVERFWD_ENABLE_MCP";
 const ENV_BLOCK_PRIVATE_ENDPOINTS: &str = "OVERFWD_BLOCK_PRIVATE_ENDPOINTS";
+const ENV_MAX_ATTACHMENT_BYTES: &str = "OVERFWD_MAX_ATTACHMENT_BYTES";
+
+/// Default cap on the total decoded size of a `send`'s attachments: 10 MiB, in line
+/// with what mainstream providers accept once base64's ~33% overhead is paid.
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 /// Immutable, process-wide server configuration (SPEC §5, §10).
 #[derive(Clone)]
@@ -43,6 +48,11 @@ pub struct Config {
     /// Turn it on for a shared, multi-tenant deployment, where an explicit endpoint
     /// header would otherwise be an SSRF primitive ([`crate::endpoint::EndpointGuard`]).
     pub block_private_endpoints: bool,
+    /// Cap on the total **decoded** size of one `send`'s attachments, in bytes
+    /// (`OVERFWD_MAX_ATTACHMENT_BYTES`, default [`DEFAULT_MAX_ATTACHMENT_BYTES`]). The
+    /// request body limit of `POST /email/send` and `POST /mcp` is derived from it
+    /// ([`crate::routes::send_body_limit`]), so raising it raises both.
+    pub max_attachment_bytes: usize,
 }
 
 /// Errors from loading [`Config`] out of the environment.
@@ -55,6 +65,8 @@ pub enum ConfigError {
     },
     #[error("{var}='{value}' is not a valid boolean (use true/false)")]
     InvalidBool { var: &'static str, value: String },
+    #[error("{var}='{value}' is not a valid non-negative integer")]
+    InvalidNumber { var: &'static str, value: String },
     #[error(
         "{ENV_REQUIRE_API_KEY}=true but {ENV_API_KEY} is unset — refusing to start a gateway \
          that requires a key it does not have"
@@ -109,12 +121,24 @@ impl Config {
             Err(_) => false,
         };
 
+        let max_attachment_bytes = match std::env::var(ENV_MAX_ATTACHMENT_BYTES) {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ConfigError::InvalidNumber {
+                    var: ENV_MAX_ATTACHMENT_BYTES,
+                    value: v,
+                })?,
+            Err(_) => DEFAULT_MAX_ATTACHMENT_BYTES,
+        };
+
         Ok(Self {
             bind,
             require_api_key,
             api_key,
             enable_mcp,
             block_private_endpoints,
+            max_attachment_bytes,
         })
     }
 }
@@ -128,6 +152,7 @@ impl std::fmt::Debug for Config {
             .field("api_key", &self.api_key)
             .field("enable_mcp", &self.enable_mcp)
             .field("block_private_endpoints", &self.block_private_endpoints)
+            .field("max_attachment_bytes", &self.max_attachment_bytes)
             .finish()
     }
 }
@@ -174,6 +199,7 @@ mod tests {
             api_key: Some(Secret::new("super-secret-key".to_string())),
             enable_mcp: true,
             block_private_endpoints: false,
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
         };
         let rendered = format!("{cfg:?}");
         assert!(

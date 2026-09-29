@@ -7,7 +7,8 @@
 //!
 //! SPEC §7 mandates at least: `auth_failure`, `host_unreachable`, `not_found`,
 //! `tls_failure`. `bad_request` and `unauthorized` cover the gateway's own request
-//! validation and Axis-1 access. `not_implemented` backs the v1 route stubs until
+//! validation and Axis-1 access; `payload_too_large` a body over a route's size
+//! limit. `not_implemented` backs the v1 route stubs until
 //! the real IMAP/SMTP bodies land. `autoconfig_failed` covers the domain→provider
 //! autoconfiguration path (missing host headers resolved from the user's domain).
 
@@ -27,6 +28,10 @@ pub enum GatewayError {
     BadRequest(String),
     /// Axis-1 gateway access denied: missing/invalid `Authorization` bearer. → 401
     Unauthorized(String),
+    /// The request body exceeded the route's size limit (`POST /email/send` and
+    /// `POST /mcp` allow room for inline attachments; everything else is at the
+    /// 2 MiB default). → 413
+    PayloadTooLarge(String),
     /// The mailbox credential was rejected by the provider (bad user/pass). → 502
     AuthFailure(String),
     /// The provider IMAP/SMTP host is unreachable (down, or wrong host/port). → 502
@@ -50,6 +55,7 @@ impl GatewayError {
         match self {
             GatewayError::BadRequest(_) => "bad_request",
             GatewayError::Unauthorized(_) => "unauthorized",
+            GatewayError::PayloadTooLarge(_) => "payload_too_large",
             GatewayError::AuthFailure(_) => "auth_failure",
             GatewayError::HostUnreachable(_) => "host_unreachable",
             GatewayError::NotFound(_) => "not_found",
@@ -68,6 +74,7 @@ impl GatewayError {
         match self {
             GatewayError::BadRequest(_) => StatusCode::BAD_REQUEST,
             GatewayError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            GatewayError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             GatewayError::AuthFailure(_) => StatusCode::BAD_GATEWAY,
             GatewayError::HostUnreachable(_) => StatusCode::BAD_GATEWAY,
             GatewayError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -82,6 +89,7 @@ impl GatewayError {
         match self {
             GatewayError::BadRequest(m)
             | GatewayError::Unauthorized(m)
+            | GatewayError::PayloadTooLarge(m)
             | GatewayError::AuthFailure(m)
             | GatewayError::HostUnreachable(m)
             | GatewayError::NotFound(m)
@@ -110,7 +118,7 @@ impl std::error::Error for GatewayError {}
 #[derive(Serialize, ToSchema)]
 pub struct ErrorResponse {
     /// Stable, machine-readable code — one of `bad_request`, `unauthorized`,
-    /// `auth_failure`, `host_unreachable`, `not_found`, `tls_failure`,
+    /// `payload_too_large`, `auth_failure`, `host_unreachable`, `not_found`, `tls_failure`,
     /// `autoconfig_failed`, `not_implemented` (SPEC §7).
     #[schema(example = "not_found")]
     pub code: String,
@@ -143,6 +151,11 @@ mod tests {
                 GatewayError::Unauthorized(String::new()),
                 "unauthorized",
                 401,
+            ),
+            (
+                GatewayError::PayloadTooLarge(String::new()),
+                "payload_too_large",
+                413,
             ),
             (
                 GatewayError::AuthFailure(String::new()),
