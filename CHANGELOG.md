@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/overspiral/overfwd/compare/v0.5.0...v0.6.0) (2026-09-30)
+
+
+### Features
+
+* **send:** accept inline base64 attachments on POST /email/send ([#36](https://github.com/overspiral/overfwd/issues/36)) ([24bea40](https://github.com/overspiral/overfwd/commit/24bea402b7c79482fcb1633631c0158baf2b487e))
+* **send:** accept inline base64 attachments on POST /email/send ([#36](https://github.com/overspiral/overfwd/issues/36)) ([38e9571](https://github.com/overspiral/overfwd/commit/38e9571d35ba7baf75afb54a0fb4a81f175dc22f))
+
 ## [0.5.0](https://github.com/overspiral/overfwd/compare/v0.4.0...v0.5.0) (2026-07-20)
 
 
