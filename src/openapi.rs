@@ -67,6 +67,8 @@ use utoipa_swagger_ui::SwaggerUi;
         crate::send::SendRequest,
         crate::send::SendResponse,
         crate::send::SendDisclosure,
+        crate::send::Attachment,
+        crate::send::AttachmentDisclosure,
         crate::imap::MessageSummary,
         crate::imap::FullMessage,
         crate::error::ErrorResponse,

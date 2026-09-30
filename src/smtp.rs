@@ -29,6 +29,8 @@ use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::transport::smtp::response::{Category, Code};
 use lettre::transport::smtp::Error as SmtpError;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+use mail_builder::encoders::base64::base64_encode_mime;
+use mail_builder::mime::MimePart;
 use mail_builder::MessageBuilder;
 
 use crate::auth::{HostPort, Secret};
@@ -150,6 +152,37 @@ pub struct OutgoingMessage {
     pub subject: String,
     /// The message body.
     pub body: OutgoingBody,
+    /// File attachments. When non-empty the message becomes `multipart/mixed`: the
+    /// body (text, html, or their `multipart/alternative`) first, then one part per
+    /// attachment. Empty means the message is built exactly as before.
+    pub attachments: Vec<OutgoingAttachment>,
+}
+
+/// One file attached to an [`OutgoingMessage`].
+///
+/// The fields are trusted here: the `send` action ([`crate::send`]) has already
+/// sanitized `filename` and validated `content_type` as a bare `type/subtype` before
+/// constructing one, so neither can carry a CR/LF into a MIME header.
+#[derive(Clone)]
+pub struct OutgoingAttachment {
+    /// The `Content-Disposition` filename (mail-builder quotes/RFC 2047-encodes it).
+    pub filename: String,
+    /// The part's `Content-Type`, e.g. `application/pdf`.
+    pub content_type: String,
+    /// The decoded file contents, sent byte-for-byte.
+    pub bytes: Vec<u8>,
+}
+
+/// Hand-written so a `{:?}` of a message (a log line, a test failure) prints the
+/// attachment's size rather than dumping its contents.
+impl std::fmt::Debug for OutgoingAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutgoingAttachment")
+            .field("filename", &self.filename)
+            .field("content_type", &self.content_type)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .finish()
+    }
 }
 
 /// Build `message` and submit it to `smtp`, authenticating as `username`/`password`
@@ -195,17 +228,60 @@ fn build_mime(message: &OutgoingMessage) -> Result<Vec<u8>, GatewayError> {
     // the blind recipients to everyone. They reach the mail via the envelope's
     // `RCPT TO` only (see `build_envelope`).
 
-    builder = match &message.body {
-        OutgoingBody::Text(text) => builder.text_body(text.as_str()),
-        OutgoingBody::Html(html) => builder.html_body(html.as_str()),
-        OutgoingBody::Both { text, html } => {
-            builder.text_body(text.as_str()).html_body(html.as_str())
+    builder = if message.attachments.is_empty() {
+        match &message.body {
+            OutgoingBody::Text(text) => builder.text_body(text.as_str()),
+            OutgoingBody::Html(html) => builder.html_body(html.as_str()),
+            OutgoingBody::Both { text, html } => {
+                builder.text_body(text.as_str()).html_body(html.as_str())
+            }
         }
+    } else {
+        builder.body(mixed_body(message)?)
     };
 
     builder
         .write_to_vec()
         .map_err(|err| GatewayError::BadRequest(format!("could not build the MIME message: {err}")))
+}
+
+/// The `multipart/mixed` tree for a message with attachments: the body part (the
+/// same text / html / `multipart/alternative` shape [`MessageBuilder`] would emit on
+/// its own), followed by one `attachment` part per file.
+///
+/// Each attachment is base64-encoded here and marked `Content-Transfer-Encoding:
+/// base64` explicitly. Left to itself, mail-builder picks an encoding by content
+/// type, and a `text/*` attachment may go out as 7bit/quoted-printable, where line
+/// endings are fair game for a relay to normalize. Base64 is the one encoding that
+/// guarantees the recipient decodes exactly the bytes the caller sent.
+fn mixed_body(message: &OutgoingMessage) -> Result<MimePart<'_>, GatewayError> {
+    let body = match &message.body {
+        OutgoingBody::Text(text) => MimePart::new("text/plain", text.as_str()),
+        OutgoingBody::Html(html) => MimePart::new("text/html", html.as_str()),
+        OutgoingBody::Both { text, html } => MimePart::new(
+            "multipart/alternative",
+            vec![
+                MimePart::new("text/plain", text.as_str()),
+                MimePart::new("text/html", html.as_str()),
+            ],
+        ),
+    };
+
+    let mut parts = Vec::with_capacity(message.attachments.len() + 1);
+    parts.push(body);
+    for attachment in &message.attachments {
+        let mut encoded = Vec::with_capacity(attachment.bytes.len() / 3 * 4 + 64);
+        base64_encode_mime(&attachment.bytes, &mut encoded, false).map_err(|err| {
+            GatewayError::BadRequest(format!("could not encode an attachment: {err}"))
+        })?;
+        parts.push(
+            MimePart::new(attachment.content_type.as_str(), encoded)
+                .attachment(attachment.filename.as_str())
+                .transfer_encoding("base64"),
+        );
+    }
+
+    Ok(MimePart::new("multipart/mixed", parts))
 }
 
 /// Build the SMTP envelope (`MAIL FROM` / `RCPT TO`) from the message.
@@ -323,6 +399,7 @@ fn is_auth_code(code: Code) -> bool {
 mod tests {
     use super::*;
     use lettre::transport::smtp::response::{Detail, Severity};
+    use mail_parser::MimeHeaders;
 
     fn msg(body: OutgoingBody) -> OutgoingMessage {
         OutgoingMessage {
@@ -332,6 +409,7 @@ mod tests {
             bcc: vec![],
             subject: "Hello".to_string(),
             body,
+            attachments: vec![],
         }
     }
 
@@ -412,6 +490,125 @@ mod tests {
             !rendered.to_ascii_lowercase().contains("bcc:"),
             "no Bcc header may be emitted: {rendered}"
         );
+    }
+
+    fn attachment(filename: &str, content_type: &str, bytes: &[u8]) -> OutgoingAttachment {
+        OutgoingAttachment {
+            filename: filename.to_string(),
+            content_type: content_type.to_string(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// The raw bytes of the first attachment part, recovered with an independent
+    /// MIME parser — the round-trip a recipient's mail client performs.
+    fn parsed_attachments(raw: &[u8]) -> Vec<(String, String, Vec<u8>)> {
+        let parsed = mail_parser::MessageParser::default()
+            .parse(raw)
+            .expect("rendered message parses");
+        parsed
+            .attachments()
+            .map(|part| {
+                let ct = part.content_type().expect("attachment has a content type");
+                (
+                    part.attachment_name().unwrap_or_default().to_string(),
+                    format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or_default()),
+                    part.contents().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attachments_produce_multipart_mixed_with_named_parts() {
+        let mut m = msg(OutgoingBody::Text("see attached".to_string()));
+        m.attachments = vec![attachment(
+            "report.pdf",
+            "application/pdf",
+            b"%PDF-1.7\x00\xff",
+        )];
+        let raw = build_mime(&m).unwrap();
+        let rendered = String::from_utf8_lossy(&raw);
+
+        assert!(rendered.contains("multipart/mixed"), "{rendered}");
+        assert!(
+            rendered.contains("Content-Type: application/pdf"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Content-Disposition: attachment; filename=\"report.pdf\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("see attached"), "{rendered}");
+        assert_eq!(
+            parsed_attachments(&raw),
+            vec![(
+                "report.pdf".to_string(),
+                "application/pdf".to_string(),
+                b"%PDF-1.7\x00\xff".to_vec()
+            )]
+        );
+    }
+
+    #[test]
+    fn attachments_wrap_the_alternative_body() {
+        let mut m = msg(OutgoingBody::Both {
+            text: "the text part".to_string(),
+            html: "<p>the html part</p>".to_string(),
+        });
+        m.attachments = vec![attachment("a.bin", "application/octet-stream", &[1, 2, 3])];
+        let raw = build_mime(&m).unwrap();
+        let rendered = String::from_utf8_lossy(&raw);
+
+        let mixed = rendered.find("multipart/mixed").expect("{rendered}");
+        let alternative = rendered.find("multipart/alternative").expect("{rendered}");
+        assert!(
+            mixed < alternative,
+            "alternative must nest inside mixed: {rendered}"
+        );
+
+        let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+        assert_eq!(parsed.body_text(0).as_deref(), Some("the text part"));
+        assert_eq!(parsed.body_html(0).as_deref(), Some("<p>the html part</p>"));
+        assert_eq!(parsed.attachment_count(), 1);
+    }
+
+    #[test]
+    fn text_attachments_are_base64_so_bytes_survive_exactly() {
+        // Bare LF, CRLF, trailing whitespace and a lone `.` line are exactly what a
+        // 7bit/QP encoding or an SMTP relay would be tempted to normalize.
+        let bytes = b"line one\nline two\r\n.\ntrailing space \n".to_vec();
+        let mut m = msg(OutgoingBody::Text("body".to_string()));
+        m.attachments = vec![attachment("notes.txt", "text/plain", &bytes)];
+        let raw = build_mime(&m).unwrap();
+
+        let rendered = String::from_utf8_lossy(&raw);
+        assert!(
+            rendered.contains("Content-Transfer-Encoding: base64"),
+            "{rendered}"
+        );
+        assert_eq!(parsed_attachments(&raw)[0].2, bytes);
+    }
+
+    #[test]
+    fn bcc_is_never_written_as_a_header_with_attachments() {
+        let mut m = msg(OutgoingBody::Text("body".to_string()));
+        m.bcc = vec!["secret-bcc@localhost".to_string()];
+        m.attachments = vec![attachment("a.txt", "text/plain", b"hi")];
+        let rendered = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        assert!(!rendered.contains("secret-bcc@localhost"), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("bcc:"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn attachment_debug_never_prints_contents() {
+        let a = attachment("a.txt", "text/plain", b"top secret contents");
+        let rendered = format!("{a:?}");
+        assert!(!rendered.contains("top secret"), "{rendered}");
+        assert!(rendered.contains("19 bytes"), "{rendered}");
     }
 
     #[test]

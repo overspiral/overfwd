@@ -36,6 +36,7 @@ Configuration is entirely environment-driven — no config files. The common kno
 | `OVERFWD_REQUIRE_API_KEY`         | `false`        | Require an `Authorization: Bearer` gateway key.    |
 | `OVERFWD_API_KEY`                 | —              | The gateway key (required when the above is true). |
 | `OVERFWD_BLOCK_PRIVATE_ENDPOINTS` | `false`        | Refuse an `X-Mailbox-Imap`/`-Smtp` target that is, or resolves to, a non-public address. |
+| `OVERFWD_MAX_ATTACHMENT_BYTES`    | `10485760`     | Cap on a `send`'s total decoded attachment size (10 MiB). The `/email/send` and `/mcp` body limit (16 MiB by default) grows with it. |
 
 **Running this as a shared, multi-tenant gateway?** Set
 `OVERFWD_BLOCK_PRIVATE_ENDPOINTS=true`. The endpoint headers are caller-supplied, so without
@@ -169,6 +170,24 @@ searches everything.
 
 `to`, `cc` and `bcc` each accept either an array or a single string, which is split on
 commas — `"to":"dest@example.com, other@example.com"` is equivalent to the array form.
+
+Attach files inline as base64. overfwd stores nothing, so the bytes travel in the request:
+
+```bash
+curl -sS http://localhost:8000/email/send \
+  -H "X-Mailbox-Auth: Basic $AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"from":"you@example.com","to":"dest@example.com","subject":"Invoice",
+       "text":"Attached.",
+       "attachments":[{"filename":"invoice.pdf","content_type":"application/pdf",
+                       "content_base64":"'"$(base64 -w0 invoice.pdf)"'"}]}'
+
+# → {"sent":true,"disclosure":{…,"attachments":[{"filename":"invoice.pdf","size_bytes":48213}]}}
+```
+
+A send takes up to 20 attachments and 10 MiB decoded in total (`OVERFWD_MAX_ATTACHMENT_BYTES`).
+`content_type` must be a plain `type/subtype`. Filenames are sanitized, not rejected. An invalid
+attachment is a `400 bad_request`, and a body over the 16 MiB limit is a `413 payload_too_large`.
 
 ## Test
 
